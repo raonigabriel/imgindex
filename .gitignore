@@ -1,0 +1,10 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+*.safegraphs
+*.safegraphs.tmp
+imgindex.log
+/dist
+/docker-context
+__pycache__/
