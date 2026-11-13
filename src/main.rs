@@ -19,9 +19,8 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 /// Build a local image index: an append-only SQLite log of every image
-/// found under a folder, plus two optional USearch vector indexes
-/// (perceptual hashes and SigLIP 2 semantic embeddings) for future
-/// similarity search.
+/// found under a folder, plus two USearch vector indexes (perceptual
+/// hashes and SigLIP 2 semantic embeddings) for similarity search.
 #[derive(Parser, Debug)]
 #[command(name = "imgindex", version, about)]
 struct Args {

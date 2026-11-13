@@ -37,7 +37,7 @@ pub const INDEX_NAMES: &[&str] = &[
 /// The database is 100% standard SQLite — plain tables only, no
 /// extensions, no vector data. Perceptual hashes and SigLIP embeddings
 /// live in a separate USearch index file (image_index.safegraphs) next
-/// to this database; imgindex itself has no search command yet.
+/// to this database; similarity search is served by `imgindex --search`.
 const IMAGES_SQL: &str = r#"
 -- Append-only log of scan observations: one row per (file, scan) pair.
 -- Every scan run appends a fresh row for each image it found on disk,
@@ -136,7 +136,7 @@ WHAT THIS DATABASE IS
   Perceptual hashes (64-bit DCT pHash) and SigLIP 2 semantic embeddings
   are NOT in this database: they live in a single USearch index file,
   image_index.safegraphs, next to it (readable with the `usearch`
-  library; imgindex itself has no search command). The index answers
+  library). The index answers
   "was this content already hashed/embedded?" via an O(1) key lookup,
   keyed by the first 8 bytes of content_hash.
 

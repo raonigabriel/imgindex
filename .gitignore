@@ -8,3 +8,5 @@ imgindex.log
 /dist
 /docker-context
 __pycache__/
+docs/
+

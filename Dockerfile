@@ -1,28 +1,29 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Runtime image for imgindex — distroless Debian 13, non-root.
+# imgindex runtime image — Debian 13 (trixie) slim, runs as uid 1000.
+# Expecting the per-architecture binaries in the build context
+# (imgindex-linux-amd64, imgindex-linux-arm64); the release workflow
+# (release.yml) prepares them.
 #
-# Contains ONLY glibc + libstdc++ (the two shared libraries the binary
-# links); the binary itself is otherwise self-contained (SQLite, SQLCipher,
-# USearch and the image decoders are all compiled in). No shell, no
-# package manager — attack surface is minimal.
-#
-# The release workflow (release.yml) expects the per-architecture binaries
-# in the build context (imgindex-linux-amd64, imgindex-linux-arm64) and
-# builds a single multi-arch manifest for linux/amd64 + linux/arm64.
-#
-# Local build (amd64):
-#   cargo build --release
-#   mkdir -p docker-context
-#   cp target/release/imgindex docker-context/imgindex-linux-x86_64
-#   cp Dockerfile docker-context/
-#   docker build --build-arg TARGETARCH=amd64 docker-context -t imgindex
-#
-# Run: the tool writes image_index.db (+ .safegraphs vector indexes) to
-# its working directory, so mount a writable volume:
-#   docker run --rm -v "$PWD:/data" -w /data imgindex --create /data
+# All state (database, vector indexes, model cache) is written to /data —
+# mount a directory there:
+#   docker run --rm -v "$PWD:/data" imgindex --create /data
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM debian:trixie-slim
+
+# TARGETARCH is a BuildKit predefined arg (amd64 / arm64 per --platform).
 ARG TARGETARCH
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libstdc++6 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 1000 --create-home --user-group imgindex
+
 COPY imgindex-linux-${TARGETARCH} /usr/local/bin/imgindex
+
+ENV HF_HOME=/data/.cache/huggingface
+USER 1000:1000
+WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/imgindex"]
