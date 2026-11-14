@@ -44,7 +44,7 @@ usearch = "2.26"
 # embeddings). CPU execution provider by default; GPU EPs are opt-in
 # cargo features (cuda / directml / coreml). Prebuilt ORT binaries are
 # downloaded by ort-sys at build time.
-ort = { version = "=2.0.0-rc.10" }
+ort = { version = "=2.0.0-rc.15" }
 # Hugging Face cache + download client (same cache layout as `hf
 # download` / the Python client; respects HF_HOME / HF_HUB_CACHE).
 # Model files are downloaded into the OFFICIAL HF cache — shared with
