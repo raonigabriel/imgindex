@@ -107,8 +107,12 @@ jobs:
               *aarch64*) arch=arm64 ;;
               *) echo "unknown arch in $tarball"; exit 1 ;;
             esac
-            tar -xzf "$tarball" -C docker-context imgindex
-            mv docker-context/imgindex "docker-context/imgindex-linux-${arch}"
+            # Package step stores members as ./imgindex etc., so extract
+            # the whole archive instead of requesting a member by name
+            tmp=$(mktemp -d)
+            tar -xzf "$tarball" -C "$tmp"
+            mv "$tmp/imgindex" "docker-context/imgindex-linux-${arch}"
+            rm -rf "$tmp"
           done
           ls -l docker-context
 
