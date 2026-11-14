@@ -34,7 +34,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
-      image: ubuntu:24.04
+      image: ubuntu:26.04
     steps:
       - name: Install build prerequisites
         run: |
@@ -81,7 +81,7 @@ jobs:
   docker:
     name: Docker image (amd64 + arm64)
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -163,7 +163,7 @@ jobs:
     name: GitHub release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
