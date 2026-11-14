@@ -194,3 +194,6 @@ jobs:
         with:
           files: imgindex-linux-*
           generate_release_notes: true
+          # force-updating a tag can flip its release to draft; publish
+          # explicitly so every run leaves a visible, downloadable release
+          draft: false
