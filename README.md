@@ -302,55 +302,49 @@ database.
 
 ## Docker
 
-Images are built for **linux/amd64** and **linux/arm64**. The container
-runs as **uid 1000** on a Debian 13 slim base (with `ca-certificates`
-and `libstdc++6`; the binary is otherwise self-contained) and keeps all
-state under `/data`: the SQLite database, the vector indexes, and the
-Hugging Face model cache.
+Images are published for **linux/amd64** and **linux/arm64**. The
+container runs as **uid 1000** (the image's `imgindex` user) on a
+Debian 13 slim base with `ca-certificates` and `libstdc++6`; the binary
+is otherwise self-contained.
 
-A typical bind-mount workflow — index a library, enrich, search:
+There are two bind mounts you care about:
+
+| Mount | What | Required by |
+|---|---|---|
+| `/data` | a writable state folder — the database, the vector indexes and the downloaded model live here | every pass |
+| `/home/imgindex/.cache/huggingface` | your **existing** Hugging Face cache (`~/.cache/huggingface` on the host) — optional; shares the SigLIP 2 model with your host tools instead of re-downloading it | `--generate-embeddings`, `--search` |
+
+Typical workflow — index a library (e.g. `~/Pictures`), enrich, search:
 
 ```bash
-mkdir -p index
+mkdir -p ~/imgindex
 
-# 1. index the library (a read-only mount is enough: --create only reads)
+# Pass 1 — index the library (a read-only mount is enough: --create only reads)
 docker run --rm \
-  -v "$HOME/Pictures:/data/library:ro" \
-  -v "$PWD/index:/data" \
-  imgindex --create /data/library
+  -v "$HOME/Pictures:/library:ro" \
+  -v "$HOME/imgindex:/data" \
+  ghcr.io/<owner>/imgindex --create /library
 
-# 2. SigLIP 2 embeddings (the model comes from your HF cache, shared
-#    with host tools like `hf download` / transformers / Python clients)
+# Pass 3 — SigLIP 2 embeddings (the model comes from your HF cache,
+# shared with host tools like `hf download` / transformers / Python)
 docker run --rm \
-  -v "$PWD/index:/data" \
-  -v "$HOME/.cache/huggingface:/data/.cache/huggingface" \
-  imgindex --generate-embeddings
+  -v "$HOME/imgindex:/data" \
+  -v "$HOME/.cache/huggingface:/home/imgindex/.cache/huggingface" \
+  ghcr.io/<owner>/imgindex --generate-embeddings
 
-# 3. text search over the embeddings (mount the HF cache so the
-#    text encoder model is available inside the container)
+# Text search over the embeddings
 docker run --rm \
-  -v "$PWD/index:/data" \
-  -v "$HOME/.cache/huggingface:/data/.cache/huggingface" \
-  imgindex --search "a small girl playing with dolls" --top 10
+  -v "$HOME/imgindex:/data" \
+  -v "$HOME/.cache/huggingface:/home/imgindex/.cache/huggingface" \
+  ghcr.io/<owner>/imgindex --search "a small girl playing with dolls" --top 10
 ```
 
-Notes:
-
-- The container runs as **uid 1000** to match a typical host user, so
-  bind-mounted files keep their ownership. If your host UID differs,
-  add `--user "$(id -u):$(id -g)"` and make the mounts writable by it.
-- **Pre-create mount points on the host** (`mkdir -p index/.cache/huggingface`)
-  before the first run: Docker creates missing mount-point directories as
-  root, and a root-owned directory under `/data` breaks the non-root
-  container writes.
-- Paths recorded in the database are the **container-namespace** paths
-  (`/data/library/...`) — consistent across every container run, which
-  is what makes scan diffs work.
-- `--generate-embeddings` and `--search` need the ONNX model files; with
-  the HF cache mounted as above, a cached model is reused without
-  network. New files added to the library between runs are picked up on
-  the next `--create`; the enrichment passes then hash/embed only the
-  new contents.
+- The container runs as uid 1000 to match a typical Linux host user, so
+  bind-mounted files keep their ownership and the generated index files
+  belong to you. If your host UID differs, add
+  `--user "$(id -u):$(id -g)"` and make the mounts writable by it.
+- Without the HF cache mount, the model downloads once into the
+  container's own cache and works fully offline afterwards.
 
 ## License
 

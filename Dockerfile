@@ -23,7 +23,6 @@ RUN apt-get update \
 
 COPY imgindex-linux-${TARGETARCH} /usr/local/bin/imgindex
 
-ENV HF_HOME=/data/.cache/huggingface
 USER 1000:1000
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/imgindex"]

@@ -1623,6 +1623,8 @@ dependencies = [
  "infer",
  "kamadak-exif",
  "libc",
+ "native-tls",
+ "openssl-sys",
  "ort",
  "rusqlite",
  "serde_json",

@@ -27,6 +27,15 @@ flate2 = "1"
 # "functions" enables registering the hamming64() scalar UDF.
 # The database stays 100% standard SQLite — no extensions embedded.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "functions"] }
+# force openssl-sys into vendored mode everywhere: builds its own OpenSSL
+# from source instead of probing for a system installation — required for
+# minimal containers without libssl-dev (and keeps SQLCipher's crypto
+# self-contained)
+openssl-sys = { version = "0.9", features = ["vendored"] }
+# native-tls is pulled in transitively by ort-sys's ureq downloader; force
+# its openssl-sys into vendored mode too, so the TLS chain never probes
+# for a system OpenSSL (which fails in minimal containers)
+native-tls = { version = "0.2", features = ["vendored"] }
 # vector search: pHash embeddings live in a separate USearch proximity-
 # graph index file (image_vectors.safegraphs). Needs cmake + g++ at BUILD
 # time only; the binary is self-contained.
