@@ -174,8 +174,23 @@ jobs:
           path: release-pkg
           merge-multiple: true
 
+      - name: Extract per-arch binaries
+        run: |
+          for tarball in release-pkg/imgindex-*-linux-*.tar.gz; do
+            case "$tarball" in
+              *x86_64*) arch=amd64 ;;
+              *aarch64*) arch=arm64 ;;
+              *) echo "unknown arch in $tarball"; exit 1 ;;
+            esac
+            tmp=$(mktemp -d)
+            tar -xzf "$tarball" -C "$tmp"
+            mv "$tmp/imgindex" "imgindex-linux-${arch}"
+            rm -rf "$tmp"
+          done
+          ls -l imgindex-linux-*
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          files: release-pkg/*.tar.gz
+          files: imgindex-linux-*
           generate_release_notes: true
