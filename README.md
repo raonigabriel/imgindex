@@ -49,6 +49,46 @@ changed since my last backup?"*, *"show me images similar to this one"*
   passes and queries work fully offline afterwards.
 - **Optional encryption** — SQLCipher-encrypted databases with `--key`.
 
+## Installation
+
+### Prebuilt binaries
+
+Every GitHub release publishes two Linux executables:
+`imgindex-linux-amd64` (x86_64) and `imgindex-linux-arm64` (aarch64).
+Everything is linked in — SQLite/SQLCipher, OpenSSL, USearch and ONNX
+Runtime — so the only runtime requirements are a system with glibc
+2.38 or newer and the standard C++ runtime (`libstdc++6`, present on
+essentially every desktop and server distro). The SigLIP 2 model
+downloads on first use into the Hugging Face cache.
+
+```bash
+# pick the asset matching your architecture
+# (uname -m: x86_64 -> amd64, aarch64 -> arm64)
+V=v0.14.0
+curl -fLO "https://github.com/raonigabriel/imgindex/releases/download/${V}/imgindex-linux-amd64"
+chmod +x imgindex-linux-amd64
+sudo mv imgindex-linux-amd64 /usr/local/bin/imgindex   # or ~/.local/bin, no sudo
+imgindex --version
+```
+
+### From source with cargo
+
+With a Rust toolchain installed, one command checks out the repo,
+compiles it and installs the binary to `~/.cargo/bin`:
+
+```bash
+cargo install --git https://github.com/raonigabriel/imgindex
+```
+
+Build prerequisites (needed at build time only — none of it ships in
+the binary): a stable Rust via rustup, a C/C++ toolchain
+(`build-essential`), `cmake` (USearch), `perl` and `pkg-config`
+(vendored OpenSSL/SQLCipher), and `libssl-dev` (ort-sys's build-time
+model downloader links the system OpenSSL). The first build is the
+slow one — vendored OpenSSL and SQLCipher compile from source, USearch
+builds via cmake, and the prebuilt ONNX Runtime is downloaded — after
+that it's a normal cargo build.
+
 ## Architecture
 
 ```
