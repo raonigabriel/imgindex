@@ -26,16 +26,11 @@ flate2 = "1"
 # sqlite, statically linked; SQLCipher build so `--key` works (AES-256).
 # "functions" enables registering the hamming64() scalar UDF.
 # The database stays 100% standard SQLite — no extensions embedded.
+# SQLCipher's crypto comes from the vendored OpenSSL feature below;
+# ort-sys's build-time model downloader links the build container's
+# system OpenSSL instead (release.yml installs libssl-dev for it) —
+# neither ships in the runtime image.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "functions"] }
-# force openssl-sys into vendored mode everywhere: builds its own OpenSSL
-# from source instead of probing for a system installation — required for
-# minimal containers without libssl-dev (and keeps SQLCipher's crypto
-# self-contained)
-openssl-sys = { version = "0.9", features = ["vendored"] }
-# native-tls is pulled in transitively by ort-sys's ureq downloader; force
-# its openssl-sys into vendored mode too, so the TLS chain never probes
-# for a system OpenSSL (which fails in minimal containers)
-native-tls = { version = "0.2", features = ["vendored"] }
 # vector search: pHash embeddings live in a separate USearch proximity-
 # graph index file (image_vectors.safegraphs). Needs cmake + g++ at BUILD
 # time only; the binary is self-contained.
@@ -44,7 +39,7 @@ usearch = "2.26"
 # embeddings). CPU execution provider by default; GPU EPs are opt-in
 # cargo features (cuda / directml / coreml). Prebuilt ORT binaries are
 # downloaded by ort-sys at build time.
-ort = { version = "=2.0.0-rc.10" }
+ort = { version = "=2.0.0-rc.15" }
 # Hugging Face cache + download client (same cache layout as `hf
 # download` / the Python client; respects HF_HOME / HF_HUB_CACHE).
 # Model files are downloaded into the OFFICIAL HF cache — shared with

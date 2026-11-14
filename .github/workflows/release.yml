@@ -15,9 +15,13 @@ env:
 
 jobs:
   # Native builds, one job per architecture, in parallel. Each runs inside
-  # an ubuntu:24.04 container (glibc 2.39, required by the statically
-  # linked ONNX Runtime 1.22 prebuilt) on a NATIVE runner — no QEMU, so
-  # the arm64 build is as fast as the amd64 one.
+  # an ubuntu:24.04 container on a NATIVE runner — no QEMU, so the arm64
+  # build is as fast as the amd64 one. Building on 24.04 (glibc 2.39)
+  # keeps the binary runnable on the debian:trixie-slim runtime image
+  # (glibc 2.41); measured symbol floor of the shipped binary is 2.38
+  # (includes the statically linked ONNX Runtime 1.31 prebuilt that
+  # ort-sys downloads). libssl-dev is build-time only: ort-sys's model
+  # downloader links it; nothing of it ships in the runtime image.
   build:
     name: Build linux/${{ matrix.arch }}
     strategy:
@@ -36,7 +40,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake curl ca-certificates perl pkg-config git
+            build-essential cmake curl ca-certificates perl pkg-config git libssl-dev
 
       - name: Checkout
         uses: actions/checkout@v7

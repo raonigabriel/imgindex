@@ -17,10 +17,25 @@
 //! (silent CPU fallback is ORT's own behavior).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::environment::Environment;
+use ort::session::{builder::GraphOptimizationLevel, Session, SessionOutputs};
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
+
+/// ort rc.14+: exactly one ORT environment per process; every session
+/// builder takes it. Created lazily on the first session.
+static ORT_ENV: OnceLock<Environment> = OnceLock::new();
+
+fn ort_environment() -> Result<Environment, String> {
+    if let Some(env) = ORT_ENV.get() {
+        return Ok(env.clone());
+    }
+    let env = ort::init().build().map_err(|e| format!("ort init: {e}"))?;
+    let _ = ORT_ENV.set(env.clone());
+    Ok(env)
+}
 
 /// Repo paths inside onnx-community/siglip2-base-patch32-256-ONNX.
 pub const VISION_FILE: &str = "onnx/vision_model_q4f16.onnx";
@@ -102,7 +117,7 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 fn new_session(model_path: &Path) -> Result<Session, String> {
-    Session::builder()
+    Session::builder(&ort_environment()?)
         .map_err(|e| format!("ort builder: {e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| format!("ort optimization: {e}"))?
@@ -116,7 +131,7 @@ fn new_session(model_path: &Path) -> Result<Session, String> {
 /// as-is when the output is [1, D]; mean-pool over the token axis when
 /// it is [1, seq, D]; then L2-normalize.
 fn finish_embedding(
-    outputs: &ort::session::output::SessionOutputs<'_>,
+    outputs: &SessionOutputs<'_>,
 ) -> Result<Vec<f32>, String> {
     // The trained projection head wins: SigLIP exports expose
     // pooler_output [1, D] next to the raw last_hidden_state [1, seq, D].
@@ -273,7 +288,7 @@ impl TextEmbedder {
 
         let session = new_session(model_path)?;
         let takes_attention_mask =
-            session.inputs.iter().any(|i| i.name == "attention_mask");
+            session.inputs().iter().any(|i| i.name() == "attention_mask");
         Ok(Self { session, tokenizer, takes_attention_mask })
     }
 
