@@ -28,13 +28,14 @@ fn big_decode_lock() -> &'static Mutex<()> {
 
 /// Pixel dimensions read from the image header — cheap, no full decode.
 /// Used by `--create` so it can record dimensions without hashing work.
-pub fn dimensions_of(path: &Path) -> Option<(u32, u32)> {
+/// The error is kept (not stringly-flattened) so callers can report WHY
+/// a file with valid image magic failed its header read.
+pub fn dimensions_of(path: &Path) -> Result<(u32, u32), image::ImageError> {
     image::ImageReader::open(path)
-        .ok()?
+        .map_err(image::ImageError::IoError)?
         .with_guessed_format()
-        .ok()?
+        .map_err(image::ImageError::IoError)?
         .into_dimensions()
-        .ok()
 }
 
 /// Decode the image once and produce its 64-bit perceptual hash.
@@ -60,12 +61,7 @@ pub fn analyze(path: &Path) -> Option<i64> {
 }
 
 fn dims_of(path: &Path) -> Option<(u32, u32)> {
-    image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
-        .ok()
+    dimensions_of(path).ok()
 }
 
 fn decode_gray(path: &Path) -> Option<GrayImage> {

@@ -19,9 +19,9 @@ embeddings) semantic search, all in plain SQL and a single binary.
 
 **Built for AI agents first.** imgindex is designed to be driven by
 coding agents — Claude, OpenCode, Codex, ZCode, Grok and others. The
-SQLite database is 100% standard SQLite, the schema briefing
-(`--agent-help`) is written to be pasted straight into an agent's
-context, and the USearch indexes are readable from Python with one
+SQLite database is 100% standard SQLite, `--skill` emits a
+Claude-compatible SKILL.md (pipe it into your agent's skills
+directory), and the USearch indexes are readable from Python with one
 `pip install`. Keep your library in an organized folder, point a cron
 job at it, and the agent can answer questions like *"find duplicate
 photos"*, *"what screenshots did I take last week?"*, *"which files
@@ -156,13 +156,25 @@ imgindex --download-model             # warm-up: prefetch ONNX model (offline pr
 imgindex --search "a small girl playing with dolls" --top 10
                                       # text search (after step 3)
 
-imgindex --agent-help                 # schema DDL briefing for AI agents
+imgindex --skill                      # SKILL.md for agents (content only —
+                                      # pipe it into your skills directory)
 
-  -e, --extensions <LIST>   extensions to consider
-                            [default: png,jpeg,jpg,webp,tiff,gif,bmp]
+  -e, --extensions <LIST>   extensions to consider (default = every
+                            format sniffable by magic AND decodable:
+                            PNG, JPEG/JFIF, WebP, TIFF, GIF, BMP, ICO,
+                            PNM, QOI, DDS, EXR, Radiance HDR, farbfeld)
+  --show-ignored <LEVEL>    per-file reject warnings on stderr:
+                            severe (corrupt/undecodable + IO errors)
+                            or all (also non-image content, empty)
   -k, --key <KEY>           SQLCipher encryption key [default: none]
   --top <N>                 result count for --search [default: 20]
 ```
+
+`--create` prints its progress live: the scan root up front, an
+aggregated counter line every 5 seconds (`processed / indexed / ignored`,
++delta in the last 5s), the total candidate count when the folder walk
+finishes, and an end-of-run report with the average processing time per
+file.
 
 ## What pass 1 alone already gives you
 
@@ -187,30 +199,42 @@ The ML passes start where that ends: `--generate-phash` (visual
 fingerprints that work *across* different captures) and
 `--generate-embeddings` (semantics + text search).
 
-## `--agent-help` — a briefing for AI agents
+## `--skill` — a SKILL.md for AI agents
 
-`imgindex --agent-help` prints a self-contained schema briefing written
-for LLM-based agents that need to query the database on their own:
+`imgindex --skill` prints a Claude-compatible
+[Agent Skill](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
+to stdout — **content only**: the user is responsible for piping it into
+a real file if they want to install it:
 
+```bash
+mkdir -p ~/.claude/skills/imgindex
+imgindex --skill > ~/.claude/skills/imgindex/SKILL.md
+```
+
+The output follows the Agent Skills format: YAML front matter with
+`name` and `description` (what the skill does + when to trigger it —
+this is what the agent loads at startup), then a markdown body with
+everything needed to drive imgindex and query the database on their own:
+
+- the **workflow**: scan → pHash → embeddings → search, as numbered
+  steps with exact commands
+- the **command reference** (`--create` and its flags, `--show-ignored`,
+  `--key`, …)
 - the **exact DDL** the tool executes (byte-for-byte the same constants
   that created the db — it cannot drift), with a comment on every column
 - the index list with each index's purpose
 - ready-made SQL recipes: latest-scan state, scan diffs, duplicate
   content, dimensions, `json_extract` over the metadata namespaces
-- gotchas an agent would otherwise trip on (`scanned_at` grouping,
-  NULL `created_at`, `id` as rowid alias, encrypted-db notes)
+- gotchas an agent would otherwise trip on (append-only history,
+  `scanned_at`/`hostname` grouping, NULL `created_at`, `id` as rowid
+  alias, encrypted-db notes, vectors living outside SQLite)
+- a complete working Python example **embedded verbatim** (kept at
+  [examples/cluster_by_phash.py](examples/cluster_by_phash.py)): it
+  loads the pHash index, demonstrates KNN search, and clusters
+  near-duplicate contents by Hamming distance
 
-It also documents the USearch vector files and points to the upstream
-project ([unum-cloud/USearch](https://github.com/unum-cloud/USearch)) —
-the same indexes are readable from Python with the `usearch` library,
-and a complete working example is **embedded in the briefing output**
-(kept at [examples/cluster_by_phash.py](examples/cluster_by_phash.py)):
-it loads the pHash index, demonstrates KNN search, and clusters
-near-duplicate contents by Hamming distance.
-
-Run it once next to the database and hand the output to your agent —
-it has everything needed to write correct queries without reading the
-imgindex source.
+Install it once next to the agent's other skills — it has everything
+needed to write correct queries without reading the imgindex source.
 
 ## How `--search` scores results
 
@@ -244,7 +268,7 @@ caveats:
   "similar" ends.
 
 Contrast with the other identifiers: `content_hash` (exact bytes) and
-`file_name_hash` (exact path) are equality checks — similarity is the
+`path_hash` (exact path) are equality checks — similarity is the
 fuzzy, graded measure that turns "find me more like this" into a
 ranked list.
 
@@ -255,25 +279,27 @@ virtual tables, openable with any sqlite3 client:
 
 ```sql
 CREATE TABLE IF NOT EXISTS images (
-    id             INTEGER PRIMARY KEY,   -- rowid alias, sequential appends
-    file_name_hash TEXT    NOT NULL,      -- SHA-256 of canonical full path
-    path           TEXT    NOT NULL,
-    file_name      TEXT    NOT NULL,
-    content_hash   TEXT    NOT NULL,      -- SHA-256 of the content
-    mime_type      TEXT    NOT NULL,      -- sniffed from magic bytes
-    size_bytes     INTEGER NOT NULL,
-    width          INTEGER NOT NULL,      -- from the image header
-    height         INTEGER NOT NULL,
-    created_at     INTEGER,               -- birth time, NULL if unavailable
-    modified_at    INTEGER,               -- unix seconds
-    scanned_at     INTEGER NOT NULL,      -- this scan's grouping key
-    metadata       TEXT                   -- JSON: exif + png_text namespaces
+    id           INTEGER PRIMARY KEY,   -- rowid alias, sequential appends
+    hostname     TEXT    NOT NULL,      -- machine that performed the scan
+    path_hash    TEXT    NOT NULL,      -- SHA-256 of canonical full path
+    path         TEXT    NOT NULL,
+    content_hash TEXT    NOT NULL,      -- SHA-256 of the content
+    mime_type    TEXT    NOT NULL,      -- sniffed from magic bytes
+    size_bytes   INTEGER NOT NULL,
+    width        INTEGER NOT NULL,      -- from the image header
+    height       INTEGER NOT NULL,
+    created_at   INTEGER,               -- birth time, NULL if unavailable
+    modified_at  INTEGER,               -- unix seconds
+    scanned_at   INTEGER NOT NULL,      -- this scan's grouping key
+    metadata     TEXT                   -- JSON: exif + png_text namespaces
 );
--- indexes on: file_name_hash, file_name, content_hash, modified_at,
---             scanned_at
+-- indexes on: path_hash, content_hash, modified_at, scanned_at
 ```
 
-- `file_name_hash` = identity of a *path* across scans (repeats once per
+- `hostname` = the machine that performed the scan, captured once per
+  run: `hostname` + `scanned_at` identifies which run on which box
+  produced a row (one database can be appended from several machines).
+- `path_hash` = identity of a *path* across scans (repeats once per
   scan, by design).
 - `content_hash` = identity of the *bytes*; equal values mean
   byte-identical files anywhere in the collection.
@@ -292,11 +318,18 @@ trust gates — checked in this order:
 |---|---|---|
 | walker | file is **0 bytes** | one stat call |
 | walker | **extension** not in `--extensions` | filtered before IO |
-| worker | magic bytes are **not a known image format** (`infer`, content-based) | one 8 KB head read |
+| worker | magic bytes are **not a known image format** (`infer` + a built-in magic supplement, content-based) | one 8 KB head read |
+| worker | format is a **real image the decoder set lacks** — HEIF/HEIC (Apple), AVIF, JPEG 2000, JPEG XL — reported as `unsupported` | sniff only |
 | worker | **image header is unreadable** (corrupt beyond the magic) | one header read |
 | worker (enrichment) | **pixels don't decode** (truncated/corrupt body) | hash runs, embedding skipped |
 | worker (enrichment) | image is **blank/near-blank** (pHash would be pure noise) | no pHash for that content |
 | worker (enrichment) | image is **oversized** (> 300 MP safety ceiling) | no pHash/embedding for it |
+
+Not in the default extension list on purpose: **TGA** (no reliable magic
+bytes, so it cannot be sniffed — and untrustworthy bytes are never
+accepted), and the decoder-less formats above (SVG, HEIC, AVIF, JPEG
+2000, JPEG XL). Real HEIC/HEIF support requires the external `libheif`
+C library, which would break the self-contained binary.
 | filesystem | **permission denied** / unreadable path | silently skipped |
 
 A row that *is* stored can still lack a perceptual hash (undecodable or

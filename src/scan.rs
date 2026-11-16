@@ -15,6 +15,32 @@ pub fn unix_ts(t: Option<SystemTime>) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
+/// The machine's host name, stored with every observation row: several
+/// machines may append to one shared database, and `hostname` +
+/// `scanned_at` together identify which run on which box produced rows.
+pub fn hostname() -> String {
+    #[cfg(unix)]
+    {
+        // gethostname(2): writes into a fixed buffer, NUL-terminated
+        // when the name fits (255 bytes is the POSIX NAME_MAX).
+        let mut buf = [0u8; 256];
+        let ok = unsafe {
+            libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+        } == 0;
+        if ok {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(name) = std::env::var("COMPUTERNAME") {
+            return name;
+        }
+    }
+    "unknown".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

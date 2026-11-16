@@ -7,9 +7,8 @@ use rusqlite::{Connection, params};
 /// disk at scan time. Perceptual hashes are NOT stored here — they live
 /// exclusively in the USearch index file.
 pub struct ImageRow {
-    pub file_name_hash: String,
+    pub path_hash: String,
     pub path: String,
-    pub file_name: String,
     pub content_hash: String,
     pub mime_type: String,
     pub size_bytes: u64,
@@ -23,15 +22,14 @@ pub struct ImageRow {
 /// Names of every secondary index, used to drop them before a bulk load
 /// and rebuild them afterwards.
 pub const INDEX_NAMES: &[&str] = &[
-    "idx_images_file_name_hash",
-    "idx_images_file_name",
+    "idx_images_path_hash",
     "idx_images_content_hash",
     "idx_images_modified_at",
     "idx_images_scanned_at",
 ];
 
-/// The executed schema doubles as the documentation (`--agent-help` and
-/// the README quote these constants verbatim) — keep the comments in sync
+/// The executed schema doubles as the documentation (`--skill` and the
+/// README quote these constants verbatim) — keep the comments in sync
 /// with reality.
 ///
 /// The database is 100% standard SQLite — plain tables only, no
@@ -51,15 +49,18 @@ CREATE TABLE IF NOT EXISTS images (
     -- insert order; append inserts are therefore always sequential,
     -- whatever order the rows arrive in.
     id             INTEGER PRIMARY KEY,
+    -- Host name of the machine that performed the scan. All rows of one
+    -- run share it; with scanned_at it identifies which run on which
+    -- box produced a row — one database can be appended from several
+    -- machines without ambiguity.
+    hostname       TEXT    NOT NULL,
     -- SHA-256 (lowercase hex) of the file's canonical absolute path.
     -- Stable identity of a path across scans: join or diff scans on it,
     -- and combine it with scanned_at for a path's history. NOT unique by
     -- design: the same file appears once per scan that saw it.
-    file_name_hash TEXT    NOT NULL,
+    path_hash      TEXT    NOT NULL,
     -- Canonical absolute path as found during the scan.
     path           TEXT    NOT NULL,
-    -- Base name of the file (last path component).
-    file_name      TEXT    NOT NULL,
     -- SHA-256 (lowercase hex) of the file content. Equal values mean
     -- byte-identical files (duplicate content across paths/scans).
     content_hash   TEXT    NOT NULL,
@@ -97,11 +98,8 @@ CREATE TABLE IF NOT EXISTS images (
 
 const INDEXES_SQL: &str = r#"
 -- Path identity: joins/diffs across scans, history of a single path.
-CREATE INDEX IF NOT EXISTS idx_images_file_name_hash
-    ON images(file_name_hash);
--- Lookups by base name (e.g. LIKE 'IMG_20%.jpg').
-CREATE INDEX IF NOT EXISTS idx_images_file_name
-    ON images(file_name);
+CREATE INDEX IF NOT EXISTS idx_images_path_hash
+    ON images(path_hash);
 -- Duplicate-content detection (same bytes under several paths/scans).
 CREATE INDEX IF NOT EXISTS idx_images_content_hash
     ON images(content_hash);
@@ -113,107 +111,210 @@ CREATE INDEX IF NOT EXISTS idx_images_scanned_at
     ON images(scanned_at);
 "#;
 
-/// Self-contained schema briefing for AI agents / LLMs: who writes the
-/// db, the commented DDL actually executed at create time, and how to
-/// query and diff scans.
-pub fn schema_doc() -> String {
+/// Self-contained SKILL.md for agents (Claude-style Agent Skill, printed
+/// by `--skill`): YAML front matter (name + description drive skill
+/// selection via progressive disclosure), then a markdown body with the
+/// workflow, command reference, the commented DDL actually executed at
+/// create time, querying recipes and gotchas. The user pipes the output
+/// into their agent's skills directory, e.g.
+///   imgindex --skill > ~/.claude/skills/imgindex/SKILL.md
+pub fn skill_md() -> String {
     format!(
-        r#"imgindex v{} — database schema briefing
+        r#"---
+name: imgindex
+description: >
+  Indexes folders of images into an append-only SQLite database
+  (image_index.db) with content hashes, header dimensions, metadata and
+  per-scan host/time stamps, and optionally adds pHash and SigLIP 2
+  embeddings to a USearch index (image_index.safegraphs) for duplicate
+  detection and natural-language image search. Use when the user asks to
+  scan or index image folders, find duplicate or near-duplicate images,
+  diff what changed between scans, run text-to-image search, or query
+  the image_index.db / image_index.safegraphs artifacts directly. Covers
+  the imgindex CLI, the images table schema, and ready-made SQL recipes.
+---
 
-WHAT THIS DATABASE IS
-  imgindex scans a folder recursively and APPENDS the result to a single
-  standard SQLite database, image_index.db, in the caller's current
-  directory. Each --create run adds one row per image it found on disk,
-  stamped with scanned_at (unix seconds); rows are never updated or
-  deleted, so the table is the full history of all scans. Only files
-  whose bytes proved to be real images are stored: empty files, non-image
-  content, and undecodable files are excluded at scan time, so every row
-  is a genuine image. The state of the disk at the most recent scan =
-  all rows whose scanned_at equals MAX(scanned_at).
-  This file is 100% standard SQLite: plain tables only, no extensions,
-  readable by any sqlite3 client. width/height are read from the image
-  header during the scan (cheap; no decoding).
-  Perceptual hashes (64-bit DCT pHash) and SigLIP 2 semantic embeddings
-  are NOT in this database: they live in a single USearch index file,
-  image_index.safegraphs, next to it (readable with the `usearch`
-  library). The index answers
-  "was this content already hashed/embedded?" via an O(1) key lookup,
-  keyed by the first 8 bytes of content_hash.
+# imgindex — local image index and similarity search
 
-IMAGES TABLE DDL (verbatim — this is what CREATE runs)
+Append-only local image index: one command scans a folder and appends
+every image found to `image_index.db` (a 100% standard SQLite file —
+plain tables, no extensions); optional enrichment passes add
+perceptual-hash (pHash) and SigLIP 2 semantic embeddings to a single
+USearch index file (`image_index.safegraphs`) next to it, enabling
+"find me more like this" search.
+
+## Workflow
+
+1. **Scan** (fast pass — no pixel decoding; hashes content, reads image
+   headers only):
+   ```bash
+   imgindex --create ~/photos
+   ```
+   Writes `./image_index.db` in the CURRENT directory (append-only: every
+   run appends one row per image seen). Progress prints live (aggregated
+   counters every 5s); the last line is a report with the average
+   processing time per file.
+2. **pHash embeddings** (optional — duplicate/near-duplicate detection):
+   ```bash
+   imgindex --generate-phash
+   ```
+3. **SigLIP 2 embeddings** (optional — natural-language search; the
+   model downloads from Hugging Face on first use):
+   ```bash
+   imgindex --generate-embeddings
+   ```
+4. **Search** (requires step 3):
+   ```bash
+   imgindex --search "a small girl playing with dolls" --top 10
+   ```
+
+## Command reference
+
+- `--create <ROOT>` — scan ROOT recursively and append to
+  `./image_index.db`.
+  - `-e, --extensions <LIST>` — candidates by file extension. Default =
+    every format that is sniffable by magic bytes AND decodable: PNG,
+    JPEG/JFIF, WebP, TIFF, GIF, BMP, ICO, PNM (PBM/PGM/PPM), QOI, DDS,
+    EXR, Radiance HDR, farbfeld.
+  - `--show-ignored severe|all` — per-file rejection warnings on stderr.
+    `severe`: corrupt/undecodable images, unsupported formats (HEIF,
+    AVIF, JPEG 2000, JPEG XL), IO errors. `all`: also plain non-image
+    content and empty files. Counts are printed either way.
+  - `-k, --key <KEY>` — SQLCipher encryption (AES-256) for the database.
+- `--generate-phash` — compute 64-bit DCT pHash per distinct content.
+- `--generate-embeddings` — compute SigLIP 2 image embeddings.
+- `--search <QUERY> --top N` — natural-language image search.
+- `--download-model` — prefetch the ONNX model into the Hugging Face
+  cache (offline preparation).
+- `--skill` — print this SKILL.md to stdout (pipe it into your agent's
+  skills directory, e.g.
+  `imgindex --skill > ~/.claude/skills/imgindex/SKILL.md`).
+
+## Database schema
+
+IMAGES TABLE DDL (verbatim — this is what CREATE runs):
+
+```sql
 {images}
-EXECUTED INDEX DDL (created after each bulk load)
+```
+
+EXECUTED INDEX DDL (created after each bulk load):
+
+```sql
 {indexes}
+```
 
-QUERYING NOTES
-  * Latest scan state:
-      SELECT * FROM images
-      WHERE scanned_at = (SELECT MAX(scanned_at) FROM images);
-  * Latest KNOWN state of each path (including paths no longer on disk):
-      SELECT path, file_name, max(scanned_at)
-      FROM images GROUP BY file_name_hash;
-  * Files removed since the most recent scan (present earlier, absent now):
-      SELECT path, MAX(scanned_at) FROM images
-      GROUP BY file_name_hash
-      HAVING MAX(scanned_at) < (SELECT MAX(scanned_at) FROM images);
-  * Content changed between the two most recent scans: compare
-    content_hash of a file_name_hash across its two newest scanned_at
-    values; content_hash equal = byte-identical.
-  * Duplicate content within one scan (same bytes, several paths):
-      SELECT i.content_hash, COUNT(*) c, group_concat(i.path)
-      FROM images i
-      WHERE i.scanned_at = (SELECT MAX(scanned_at) FROM images)
-      GROUP BY i.content_hash HAVING c > 1;
-  * Dimensions come straight from the image header at scan time:
-      SELECT path, width, height FROM images
-      WHERE scanned_at = (SELECT MAX(scanned_at) FROM images);
-  * metadata is a JSON object NAMESPACED BY SOURCE — it is not only
-    EXIF. "exif" holds EXIF tags (JPEG/TIFF containers and the
-    Exif/EXIF chunks of PNG/WebP); "png_text" holds PNG-native text
-    metadata (tEXt/zTXt/iTXt keywords plus tIME). Parse with any JSON
-    library, and a namespace may be absent:
-      SELECT json_extract(metadata, '$.exif.Model'),
-             json_extract(metadata, '$.png_text.Title')
-      FROM images WHERE metadata IS NOT NULL;
-  * mime_type is sniffed from magic bytes and always image/*; do NOT
-    trust the path extension over it.
-  * created_at may be NULL (birth time unavailable); modified_at is the
-    reliable timestamp for time ranges.
-  * id is the rowid alias (auto-incrementing across appends) and is
-    itself the table's B-tree key: WHERE id = ? is an index seek and no
-    explicit index exists (or is needed) for it.
-  * scanned_at is captured once per run, before the scan starts — all
-    rows of one execution share the exact value, making it a safe
-    grouping key:
-      SELECT scanned_at, COUNT(*) FROM images GROUP BY scanned_at;
-  * Size ranges, e.g. the largest files of the latest scan:
-      SELECT path, size_bytes FROM images
-      WHERE scanned_at = (SELECT MAX(scanned_at) FROM images)
-        AND size_bytes > 10 * 1024 * 1024
-      ORDER BY size_bytes DESC;
-  * Introspection: PRAGMA table_info(images);
-    SELECT sql FROM sqlite_master WHERE type='table'; / type='index';
-  * Databases written with the --key option are SQLCipher-encrypted and
-    need that key (PRAGMA key) — plain sqlite3 builds cannot open them.
-    Unencrypted databases open with any standard SQLite client.
+## Querying recipes
 
-VECTOR INDEX LIBRARY (USearch)
-  The pHash embeddings are stored and searched with USearch, the
-  single-file vector-search engine from Unum:
-    https://github.com/unum-cloud/USearch
-  Both the Rust crate (`usearch`) and the Python library (`pip install
-  usearch`) expose the same index format, so the serialized pHash index
-  inside image_index.safegraphs can be read from either language.
+- Latest scan state (one scan = one `scanned_at` value):
 
-PYTHON EXAMPLE — clustering images by pHash (KNN + near-duplicate
-grouping) with the `usearch` Python library. The file below is embedded
-verbatim from examples/cluster_by_phash.py in the source repository:
+  ```sql
+  SELECT * FROM images
+  WHERE scanned_at = (SELECT MAX(scanned_at) FROM images);
+  ```
+
+- Latest KNOWN state of each path (including paths no longer on disk):
+
+  ```sql
+  SELECT path, max(scanned_at) FROM images GROUP BY path_hash;
+  ```
+
+- Files removed since the most recent scan (present earlier, absent now):
+
+  ```sql
+  SELECT path, MAX(scanned_at) FROM images
+  GROUP BY path_hash
+  HAVING MAX(scanned_at) < (SELECT MAX(scanned_at) FROM images);
+  ```
+
+- Content changed between the two most recent scans: compare
+  `content_hash` of a `path_hash` across its two newest `scanned_at`
+  values; equal hashes = byte-identical.
+
+- Duplicate content within one scan (same bytes, several paths):
+
+  ```sql
+  SELECT i.content_hash, COUNT(*) c, group_concat(i.path)
+  FROM images i
+  WHERE i.scanned_at = (SELECT MAX(scanned_at) FROM images)
+  GROUP BY i.content_hash HAVING c > 1;
+  ```
+
+- Dimensions come straight from the image header at scan time:
+
+  ```sql
+  SELECT path, width, height FROM images
+  WHERE scanned_at = (SELECT MAX(scanned_at) FROM images);
+  ```
+
+- Which run produced which rows (`hostname` and `scanned_at` are both
+  captured once per run — together they identify the run and the box):
+
+  ```sql
+  SELECT hostname, scanned_at, COUNT(*) FROM images
+  GROUP BY hostname, scanned_at;
+  ```
+
+- metadata is a JSON object NAMESPACED BY SOURCE — `exif` (JPEG/TIFF
+  containers and PNG/WebP Exif/EXIF chunks) and `png_text` (tEXt/zTXt/
+  iTXt/tIME chunks); a namespace may be absent:
+
+  ```sql
+  SELECT json_extract(metadata, '$.exif.Model'),
+         json_extract(metadata, '$.png_text.Title')
+  FROM images WHERE metadata IS NOT NULL;
+  ```
+
+- Largest files of the latest scan:
+
+  ```sql
+  SELECT path, size_bytes FROM images
+  WHERE scanned_at = (SELECT MAX(scanned_at) FROM images)
+    AND size_bytes > 10 * 1024 * 1024
+  ORDER BY size_bytes DESC;
+  ```
+
+- Introspection: `PRAGMA table_info(images);` and
+  `SELECT sql FROM sqlite_master WHERE type='table';`
+
+## Gotchas
+
+- The database is APPEND-ONLY: rows are never updated or deleted, so the
+  table is the full history across scans. The current state of the disk
+  is the set of rows with `scanned_at = MAX(scanned_at)`.
+- `mime_type` is sniffed from magic bytes (never trusted from the
+  extension) and is always `image/*`. Formats that are recognized but
+  not decodable (HEIF/HEIC — Apple, AVIF, JPEG 2000, JPEG XL) never get
+  rows; they are reported as `unsupported` rejections. TGA and SVG are
+  not indexable (no sniffable magic / no raster decoder).
+- `width`/`height` are read from the image HEADER during the scan —
+  cheap, no decoding.
+- Perceptual hashes and semantic embeddings are NOT in this database:
+  they live in the USearch index file `image_index.safegraphs`, keyed by
+  the first 8 bytes of `content_hash`. Both the Rust crate (`usearch`)
+  and the Python library (`pip install usearch`) read the same format.
+- Databases written with `--key` are SQLCipher-encrypted: plain sqlite3
+  builds cannot open them without the key (`PRAGMA key`). Unencrypted
+  databases open with any standard SQLite client.
+- `created_at` (birth time) may be NULL; `modified_at` is the reliable
+  timestamp for time ranges.
+- `id` is the rowid alias: `WHERE id = ?` is an index seek; no explicit
+  index exists (or is needed) for it.
+- Never write to the images table from outside imgindex: the tool
+  assumes its rows are observations made by scans.
+
+## Python example — cluster near-duplicates by pHash
+
+Reads the two artifacts `imgindex --create` / `--generate-phash` produce
+in the current directory, does exact KNN with the USearch Python library
+and clusters every content by Hamming distance (single-linkage).
+Embedded verbatim from examples/cluster_by_phash.py in the source
+repository:
 
 ```python
 {py_example}
 ```
 "#,
-        env!("CARGO_PKG_VERSION"),
         images = IMAGES_SQL,
         indexes = INDEXES_SQL,
         py_example = include_str!("../examples/cluster_by_phash.py"),
@@ -258,17 +359,22 @@ pub fn create_indexes(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn insert_image(conn: &Connection, row: &ImageRow, scanned_at: i64) -> rusqlite::Result<usize> {
+pub fn insert_image(
+    conn: &Connection,
+    row: &ImageRow,
+    hostname: &str,
+    scanned_at: i64,
+) -> rusqlite::Result<usize> {
     conn.execute(
         "INSERT INTO images
-            (file_name_hash, path, file_name, content_hash, mime_type,
+            (hostname, path_hash, path, content_hash, mime_type,
              size_bytes, width, height, created_at, modified_at,
              scanned_at, metadata)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
-            row.file_name_hash,
+            hostname,
+            row.path_hash,
             row.path,
-            row.file_name,
             row.content_hash,
             row.mime_type,
             row.size_bytes as i64,

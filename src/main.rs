@@ -9,12 +9,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc::sync_channel, Arc};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -28,9 +29,11 @@ struct Args {
     #[arg(long)]
     create: bool,
 
-    /// Print the commented database schema DDL, for AI agents / tooling
+    /// Print a Claude/agent-compatible SKILL.md to stdout (content only)
+    /// — pipe it into your agent's skills directory, e.g.
+    /// imgindex --skill > ~/.claude/skills/imgindex/SKILL.md
     #[arg(long)]
-    agent_help: bool,
+    skill: bool,
 
     /// Compute pHash embeddings for contents not yet hashed
     #[arg(long)]
@@ -55,29 +58,61 @@ struct Args {
     /// Root folder to traverse recursively (required by --create)
     root: Option<PathBuf>,
 
-    /// Comma-separated extensions to consider
+    /// Comma-separated extensions to consider. The default list covers
+    /// every format this binary can both sniff by magic and decode:
+    /// PNG, JPEG/JFIF, WebP, TIFF, GIF, BMP, ICO, PNM (PBM/PGM/PPM),
+    /// QOI, DDS, EXR, Radiance HDR and farbfeld. Formats without a
+    /// decoder in the image crate (HEIC/HEIF, AVIF, JPEG 2000, JPEG XL,
+    /// SVG) or without a sniffable magic (TGA) are deliberately absent.
     #[arg(
         short,
         long,
         value_delimiter = ',',
-        default_value = "png,jpeg,jpg,webp,tiff,gif,bmp",
+        default_value = "png,jpeg,jpg,jfif,webp,tiff,tif,gif,bmp,ico,pnm,pbm,pgm,ppm,qoi,dds,exr,ff,hdr",
         value_name = "LIST"
     )]
     extensions: Vec<String>,
+
+    /// Per-file ignore warnings during --create, printed to stderr while
+    /// files are rejected. `severe` shows only files that claimed to be
+    /// images but failed to decode, plus open/read errors; `all` also
+    /// shows plain non-image content and empty files. End-of-run counts
+    /// are printed either way.
+    #[arg(long, value_enum, value_name = "severe|all")]
+    show_ignored: Option<ShowIgnored>,
 
     /// SQLCipher encryption key for the database (default: none)
     #[arg(short = 'k', long, value_name = "KEY")]
     key: Option<String>,
 }
 
+/// How much per-file detail `--create` prints for ignored files.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ShowIgnored {
+    /// Only severe rejections: image-formatted bytes that failed to
+    /// decode, and open/read errors.
+    Severe,
+    /// Every ignored file, including benign non-image content.
+    All,
+}
+
+/// Severity classes for ignored files, reported by --show-ignored.
+/// BENIGN: the content simply isn't a usable image (unknown or
+/// non-image magic, zero bytes). SEVERE: the bytes claimed to be an
+/// image but the header can't be parsed, or the file couldn't be read.
+const SEV_BENIGN: u8 = 1;
+const SEV_SEVERE: u8 = 2;
+/// Reporting floor when no --show-ignored level is given: no per-file
+/// lines (the end-of-run counts are still printed).
+const SEV_NEVER: u8 = 3;
+
 
 /// One accepted observation of a file at scan time. Deliberately tiny:
 /// no pixel decoding happens during --create (dimensions come from the
 /// image header, which is a cheap read).
 struct ScanResult {
-    file_name_hash: String,
+    path_hash: String,
     path: String,
-    file_name: String,
     content_hash: String,
     mime_type: String,
     size_bytes: u64,
@@ -119,8 +154,8 @@ fn main() {
 
     let args = Args::parse();
 
-    if args.agent_help {
-        print!("{}", db::schema_doc());
+    if args.skill {
+        print!("{}", db::skill_md());
         return;
     }
 
@@ -371,16 +406,79 @@ fn run_generate_embeddings(db_path: &Path, key: Option<&str>) -> Result<(), Box<
     Ok(())
 }
 
+/// Print one ignored-file line when `--show-ignored` asks for its
+/// severity class. stderr only: stdout stays a clean summary.
+fn report_ignored(floor: &AtomicU8, severity: u8, path: &Path, class: &str, detail: &str) {
+    if floor.load(Ordering::Relaxed) <= severity {
+        eprintln!("ignored [{class}] {}: {detail}", path.display());
+    }
+}
+
+/// The image mime carried by the bytes, or None when the content isn't a
+/// decodable image. infer's magic table is authoritative; a small
+/// supplement covers raster formats the image crate decodes but infer
+/// doesn't table (PNM family, QOI, DDS, EXR, Radiance HDR, farbfeld).
+/// TGA is deliberately absent: it has no reliable magic, so it can't be
+/// sniffed — and what can't be sniffed isn't accepted.
+fn sniff_mime(head: &[u8]) -> Option<String> {
+    if let Some(t) = infer::get(head) {
+        return t
+            .mime_type()
+            .starts_with("image/")
+            .then(|| t.mime_type().to_string());
+    }
+    // PNM magic, per spec: 'P' + '1'..'6' (ASCII or binary) + whitespace.
+    if head.len() >= 3
+        && head[0] == b'P'
+        && (b'1'..=b'6').contains(&head[1])
+        && head[2].is_ascii_whitespace()
+    {
+        return Some("image/x-portable-anymap".into());
+    }
+    const SUPPLEMENT: &[(&[u8], &str)] = &[
+        (b"qoif", "image/qoi"),                       // QOI
+        (b"DDS ", "image/x-dds"),                     // DirectDraw Surface
+        (b"\x76\x2f\x31\x01", "image/x-exr"),         // OpenEXR
+        (b"#?RADIANCE", "image/vnd.radiance"),        // Radiance HDR
+        (b"#?RGBE", "image/vnd.radiance"),            // Radiance HDR (alt)
+        (b"farbfeld", "image/x-farbfeld"),            // farbfeld
+    ];
+    SUPPLEMENT
+        .iter()
+        .find(|(magic, _)| head.starts_with(magic))
+        .map(|(_, mime)| mime.to_string())
+}
+
+/// Real image formats the decoder set cannot open. Sniffing still
+/// recognizes them, so they are reported honestly instead of
+/// masquerading as corruption.
+const UNDECODABLE: &[(&str, &str)] = &[
+    ("image/heif", "HEIF/HEIC (Apple/iPhone) — needs libheif, which this binary doesn't ship"),
+    ("image/jp2", "JPEG 2000 — no decoder in the image crate"),
+    ("image/avif", "AVIF — the image crate has no AVIF decoder"),
+    ("image/jxl", "JPEG XL — no decoder in the image crate"),
+];
+
 /// Sniff + hash one file during --create. Returns `None` for anything
 /// whose bytes don't prove it is an image (unknown magic or non-image
-/// mime) and for IO errors — such files are silently left out. The magic
-/// check and the header-dimension read both run before hashing, so a
-/// corrupt file costs one head read. No decoding happens here:
-/// perceptual hashes and embeddings come from the enrichment passes.
-fn process_file(task: FileTask, skipped_not_image: &AtomicU64) -> Option<ScanResult> {
+/// mime) and for IO errors — such files are left out. The magic check
+/// and the header-dimension read both run before hashing, so a corrupt
+/// file costs one head read. No decoding happens here: perceptual hashes
+/// and embeddings come from the enrichment passes.
+fn process_file(
+    task: FileTask,
+    skipped_not_image: &AtomicU64,
+    ignored_floor: &AtomicU8,
+) -> Option<ScanResult> {
     let FileTask { path, size_bytes, created_at, modified_at } = task;
 
-    let file = File::open(&path).ok()?;
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            report_ignored(ignored_floor, SEV_SEVERE, &path, "io", &format!("open failed: {e}"));
+            return None;
+        }
+    };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut head = [0u8; HEAD_LEN];
     let mut filled = 0;
@@ -388,26 +486,56 @@ fn process_file(task: FileTask, skipped_not_image: &AtomicU64) -> Option<ScanRes
         match reader.read(&mut head[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
-            Err(_) => return None,
+            Err(e) => {
+                report_ignored(ignored_floor, SEV_SEVERE, &path, "io", &format!("read failed: {e}"));
+                return None;
+            }
         }
     }
 
     // Trust the bytes, not the extension: unknown content and non-image
     // types (a mislabeled video, a truncated file) are ignored outright.
-    let mime_type = match infer::get(&head[..filled]) {
-        Some(t) if t.mime_type().starts_with("image/") => t.mime_type().to_string(),
-        _ => {
+    let mime_type = match sniff_mime(&head[..filled]) {
+        Some(mime) => mime,
+        None => {
             skipped_not_image.fetch_add(1, Ordering::Relaxed);
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("(none)");
+            let detail = match infer::get(&head[..filled]) {
+                Some(t) => format!(
+                    "content is {}, not an image (extension .{}, {} bytes)",
+                    t.mime_type(),
+                    ext,
+                    size_bytes
+                ),
+                None => format!(
+                    "no known magic — not an image (extension .{}, {} bytes)",
+                    ext,
+                    size_bytes
+                ),
+            };
+            report_ignored(ignored_floor, SEV_BENIGN, &path, "not-an-image", &detail);
             return None;
         }
     };
 
+    // Recognized image formats the decoder set can't open: report
+    // honestly instead of pretending the file is corrupt.
+    if let Some((_, why)) = UNDECODABLE.iter().find(|(mime, _)| *mime == mime_type) {
+        skipped_not_image.fetch_add(1, Ordering::Relaxed);
+        report_ignored(ignored_floor, SEV_SEVERE, &path, "unsupported", why);
+        return None;
+    }
+
     // Header dimension read before hashing: a file whose magic passed
     // but whose header can't be parsed is corrupt — skip without the
     // full-content hash.
-    let Some((width, height)) = phash::dimensions_of(&path) else {
-        skipped_not_image.fetch_add(1, Ordering::Relaxed);
-        return None;
+    let (width, height) = match phash::dimensions_of(&path) {
+        Ok(dims) => dims,
+        Err(e) => {
+            skipped_not_image.fetch_add(1, Ordering::Relaxed);
+            report_ignored(ignored_floor, SEV_SEVERE, &path, "corrupt", &e.to_string());
+            return None;
+        }
     };
 
     let mut hasher = Sha256::new();
@@ -419,21 +547,22 @@ fn process_file(task: FileTask, skipped_not_image: &AtomicU64) -> Option<ScanRes
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => hasher.update(&buf[..n]),
-            Err(_) => return None,
+            Err(e) => {
+                report_ignored(ignored_floor, SEV_SEVERE, &path, "io", &format!("read failed mid-hash: {e}"));
+                return None;
+            }
         }
     }
     let content_hash = hex::encode(hasher.finalize());
 
     let path_str = path.to_string_lossy().into_owned();
-    let file_name_hash = scan::sha256_hex(path_str.as_bytes());
-    let file_name = path.file_name()?.to_string_lossy().into_owned();
+    let path_hash = scan::sha256_hex(path_str.as_bytes());
 
     let metadata = metadata::extract(&path, &mime_type);
 
     Some(ScanResult {
-        file_name_hash,
+        path_hash,
         path: path_str,
-        file_name,
         content_hash,
         mime_type,
         size_bytes,
@@ -522,8 +651,10 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
     let started = Instant::now();
     // Captured once, before the walker starts: every row appended by this
     // run receives this exact value, so scanned_at doubles as the scan's
-    // grouping key (rows of one execution always share it).
+    // grouping key (rows of one execution always share it). The host name
+    // is captured the same way: with scanned_at it identifies the run.
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let hostname = scan::hostname();
 
     let root = root.canonicalize()?;
     if !root.is_dir() {
@@ -539,6 +670,13 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
         return Err("the extension list is empty".into());
     }
 
+    // First feedback, before any work starts: what is being scanned.
+    println!(
+        "scanning {} — extensions: {}",
+        root.display(),
+        args.extensions.join(",")
+    );
+
     let db_path = image_index_path()?;
     let mut conn = db::open(&db_path, args.key.as_deref())?;
     db::create_table(&conn)?;
@@ -546,6 +684,16 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
 
     let skipped_zero_byte = Arc::new(AtomicU64::new(0));
     let skipped_not_image = Arc::new(AtomicU64::new(0));
+    // Per-file ignore reporting floor (see --show-ignored).
+    let ignored_floor = Arc::new(AtomicU8::new(match args.show_ignored {
+        Some(ShowIgnored::All) => SEV_BENIGN,
+        Some(ShowIgnored::Severe) => SEV_SEVERE,
+        None => SEV_NEVER,
+    }));
+    // Live progress counters: files finished by the workers / handed out
+    // by the walker.
+    let processed = Arc::new(AtomicU64::new(0));
+    let discovered = Arc::new(AtomicU64::new(0));
 
     let n_workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
@@ -554,6 +702,38 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
     let (task_tx, task_rx) = sync_channel::<FileTask>(256);
     let (res_tx, res_rx) = sync_channel::<ScanResult>(256);
 
+    // Progress reporter: an aggregated line every 5s once hashing is
+    // underway. Exits the moment it's stopped, so the final summary is
+    // never delayed.
+    let (stop_tx, stop_rx) = channel::<()>();
+    let reporter = {
+        let processed = Arc::clone(&processed);
+        let skipped_zero_byte = Arc::clone(&skipped_zero_byte);
+        let skipped_not_image = Arc::clone(&skipped_not_image);
+        thread::spawn(move || {
+            let started = Instant::now();
+            let mut last_seen = 0u64;
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                let done = processed.load(Ordering::Relaxed);
+                let ignored = skipped_zero_byte.load(Ordering::Relaxed)
+                    + skipped_not_image.load(Ordering::Relaxed);
+                println!(
+                    "  … {:.0}s: {} processed, {} indexed, {} ignored (+{} in the last 5s)",
+                    started.elapsed().as_secs_f32(),
+                    done,
+                    done - ignored,
+                    ignored,
+                    done - last_seen
+                );
+                last_seen = done;
+            }
+        })
+    };
+
     // Producer: walk the tree, filter by extension, stat each match.
     // Empty files are rejected here, before any worker spends IO on them;
     // traversal errors and stat failures are silently skipped.
@@ -561,6 +741,8 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
         let root = root.clone();
         let exts = exts.clone();
         let skipped_zero_byte = Arc::clone(&skipped_zero_byte);
+        let ignored_floor = Arc::clone(&ignored_floor);
+        let discovered = Arc::clone(&discovered);
         thread::spawn(move || {
             for entry in walkdir::WalkDir::new(root) {
                 let Ok(entry) = entry else { continue };
@@ -584,6 +766,7 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
                 };
                 if meta.len() == 0 {
                     skipped_zero_byte.fetch_add(1, Ordering::Relaxed);
+                    report_ignored(&ignored_floor, SEV_BENIGN, &path, "empty", "zero-byte file");
                     continue;
                 }
                 let task = FileTask {
@@ -592,10 +775,18 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
                     created_at: scan::unix_ts(meta.created().ok()),
                     modified_at: scan::unix_ts(meta.modified().ok()),
                 };
+                discovered.fetch_add(1, Ordering::Relaxed);
                 if task_tx.send(task).is_err() {
                     break; // workers are gone, stop walking
                 }
             }
+            // Printed by the walker itself (not the reporter) so the
+            // candidate count lands the moment the walk ends, not on the
+            // next 5s tick — which a run can outlive.
+            println!(
+                "  walk complete: {} candidate file(s) — hashing …",
+                discovered.load(Ordering::Relaxed)
+            );
         })
     };
 
@@ -606,10 +797,14 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
         let task_rx = Arc::clone(&task_rx);
         let res_tx = res_tx.clone();
         let skipped_not_image = Arc::clone(&skipped_not_image);
+        let ignored_floor = Arc::clone(&ignored_floor);
+        let processed = Arc::clone(&processed);
         workers.push(thread::spawn(move || loop {
             let task = task_rx.lock().expect("task channel mutex poisoned").recv();
             let Ok(task) = task else { break };
-            if let Some(result) = process_file(task, &skipped_not_image)
+            let result = process_file(task, &skipped_not_image, &ignored_floor);
+            processed.fetch_add(1, Ordering::Relaxed);
+            if let Some(result) = result
                 && res_tx.send(result).is_err()
             {
                 break; // writer is gone
@@ -623,13 +818,14 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
         worker.join().expect("worker thread panicked");
     }
     producer.join().expect("producer thread panicked");
+    let _ = stop_tx.send(());
+    reporter.join().expect("reporter thread panicked");
 
     let mut rows: Vec<db::ImageRow> = Vec::with_capacity(scanned.len());
     for r in &scanned {
         rows.push(db::ImageRow {
-            file_name_hash: r.file_name_hash.clone(),
+            path_hash: r.path_hash.clone(),
             path: r.path.clone(),
-            file_name: r.file_name.clone(),
             content_hash: r.content_hash.clone(),
             mime_type: r.mime_type.clone(),
             size_bytes: r.size_bytes,
@@ -640,7 +836,7 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
             metadata: r.metadata.clone(),
         });
     }
-    rows.sort_unstable_by(|a, b| a.file_name_hash.cmp(&b.file_name_hash));
+    rows.sort_unstable_by(|a, b| a.path_hash.cmp(&b.path_hash));
 
     // Drop + rebuild the secondary indexes when the batch is a large
     // fraction of the table; otherwise let SQLite maintain them
@@ -655,7 +851,7 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
             db::drop_indexes(&tx)?;
         }
         for row in &rows {
-            db::insert_image(&tx, row, now)?;
+            db::insert_image(&tx, row, &hostname, now)?;
         }
         // No-op in incremental mode; the bulk (re)build in rebuild mode.
         db::create_indexes(&tx)?;
@@ -685,5 +881,17 @@ fn run_create(args: &Args, root: PathBuf) -> Result<(), Box<dyn std::error::Erro
         if rebuild { "index rebuild" } else { "incremental" }
     );
     println!("hint: run --generate-phash and/or --generate-embeddings to enrich, then --search to query");
+
+    // End-of-run report: raw counters plus the derived per-file cost.
+    let processed_files = processed.load(Ordering::Relaxed);
+    let elapsed = started.elapsed();
+    let secs = elapsed.as_secs_f64();
+    println!(
+        "report: processed {} file(s) in {:.1?} — avg {:.2} ms/file ({:.0} file(s)/s)",
+        processed_files,
+        elapsed,
+        if processed_files > 0 { secs * 1000.0 / processed_files as f64 } else { 0.0 },
+        if secs > 0.0 { processed_files as f64 / secs } else { 0.0 },
+    );
     Ok(())
 }
