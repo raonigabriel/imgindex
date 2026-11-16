@@ -11,7 +11,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -211,11 +211,16 @@ fn main() {
         return;
     }
     if args.download_model {
-        if let Err(e) = embed::ensure_models() {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+        match embed::ensure_models() {
+            Ok(files) => {
+                embed::report_fetched(&files);
+                println!("model ready (Hugging Face cache)");
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
-        println!("model ready (Hugging Face cache)");
         return;
     }
     if !args.create {
@@ -241,6 +246,96 @@ fn main() {
 /// hashed?" via an O(1) key lookup — only misses get decoded. Contents
 /// whose files are gone or unreadable are skipped and counted; a lost or
 /// desynced index file simply regenerates from the live files.
+/// Snapshot counters for one enrichment pass: what the loop has done so
+/// far, shared with the ticker thread (the loop is the only writer).
+#[derive(Clone, Copy)]
+struct EnrichCounters {
+    done: usize,
+    total: usize,
+    newly: usize,
+    already: usize,
+    missing: usize,
+    bad: usize,
+}
+
+/// Live progress for the enrichment passes — the same idea as --create's
+/// hashing reporter: one aggregated line every 5 seconds while contents
+/// are processed, and a `finish()` that stops the thread the moment the
+/// loop ends so the end-of-run summary is never delayed. Inference runs
+/// ~0.5-1 s per content, so a count-based cadence would stay silent for
+/// minutes; this is time-based like --create's.
+struct EnrichProgress {
+    counters: Arc<Mutex<EnrichCounters>>,
+    stop_tx: std::sync::mpsc::Sender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EnrichProgress {
+    /// Starts the ticker thread. The verbs label the counter groups in
+    /// the periodic line: ("hashed", "unhashable") for pHash,
+    /// ("embedded", "failed") for SigLIP embeddings. They must be
+    /// 'static because the ticker thread outlives this call.
+    fn new(total: usize, done_verb: &'static str, bad_verb: &'static str) -> Self {
+        let counters = Arc::new(Mutex::new(EnrichCounters {
+            done: 0,
+            total,
+            newly: 0,
+            already: 0,
+            missing: 0,
+            bad: 0,
+        }));
+        let (stop_tx, stop_rx) = channel::<()>();
+        let handle = {
+            let counters = Arc::clone(&counters);
+            thread::spawn(move || {
+                let started = Instant::now();
+                let mut last_seen = 0usize;
+                loop {
+                    match stop_rx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let c = *counters.lock().expect("enrich progress poisoned");
+                    println!(
+                        "  … {:.0}s: {}/{} contents — {} newly {done_verb}, {} already, {} missing, {} {bad_verb} (+{} in the last 5s)",
+                        started.elapsed().as_secs_f32(),
+                        c.done,
+                        c.total,
+                        c.newly,
+                        c.already,
+                        c.missing,
+                        c.bad,
+                        c.done - last_seen,
+                        done_verb = done_verb,
+                        bad_verb = bad_verb,
+                    );
+                    last_seen = c.done;
+                }
+            })
+        };
+        Self {
+            counters,
+            stop_tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Mutable snapshot for the pass loop — the only writer.
+    fn counters(&self) -> MutexGuard<'_, EnrichCounters> {
+        self.counters.lock().expect("enrich progress poisoned")
+    }
+
+    /// Stops the ticker (joining it) and returns the final counters for
+    /// the end-of-run summary.
+    fn finish(mut self) -> EnrichCounters {
+        let _ = self.stop_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("progress thread panicked");
+        }
+        *self.counters.lock().expect("enrich progress poisoned")
+    }
+}
+
 fn run_generate_phash(db_path: &Path, key: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     if !db_path.exists() {
@@ -254,10 +349,6 @@ fn run_generate_phash(db_path: &Path, key: Option<&str>) -> Result<(), Box<dyn s
     db::create_table(&conn)?;
 
     let contents = db::contents_all(&conn)?;
-    let mut already_hashed = 0usize;
-    let mut newly_hashed = 0usize;
-    let mut file_missing = 0usize;
-    let mut unhashable = 0usize;
 
     // Preload all observed paths once: the loop then runs without
     // touching the database connection.
@@ -266,50 +357,51 @@ fn run_generate_phash(db_path: &Path, key: Option<&str>) -> Result<(), Box<dyn s
     let index_path = vecsearch::index_path(db_path);
     let mut store = vecsearch::VectorStore::open(&index_path)?;
 
-    for (done, content_hash) in contents.iter().enumerate() {
-        // The USearch key IS the lookup: an existing embedding means the
+    println!(
+        "enriching {} content(s) with perceptual hashes → {}",
+        contents.len(),
+        index_path.display()
+    );
+    let prog = EnrichProgress::new(contents.len(), "hashed", "unhashable");
+    for content_hash in &contents {
+        let mut c = prog.counters();
+        c.done += 1;
+        // The USearch key IS the lookup: an existing hash means the
         // content was hashed in an earlier pass — no decode needed.
         if store.phash_has(content_hash) {
-            already_hashed += 1;
+            c.already += 1;
             continue;
         }
         // The content may exist under several paths (duplicates) and any
         // of them may have been deleted since; find one that is alive.
         let paths = all_paths.get(content_hash).cloned().unwrap_or_default();
-        let live = paths.iter().find(|p| Path::new(p).exists());
-        let Some(live_path) = live else {
-            file_missing += 1;
+        let Some(live_path) = paths.iter().find(|p| Path::new(p).exists()) else {
+            c.missing += 1;
             continue;
         };
         let Some(fingerprint) = phash::analyze(Path::new(live_path)) else {
-            unhashable += 1;
+            c.bad += 1;
             continue;
         };
         store.phash_add(content_hash, fingerprint)?;
-        newly_hashed += 1;
-
-        if newly_hashed.is_multiple_of(500) {
-            println!(
-                "  … {}/{} contents processed ({} newly hashed)",
-                done + 1,
-                contents.len(),
-                newly_hashed
-            );
-        }
+        c.newly += 1;
     }
+    let c = prog.finish();
 
-    if newly_hashed > 0 {
+    if c.newly > 0 {
         store.save()?;
     }
 
     println!(
-        "contents: {} total — already hashed: {}, newly hashed: {} ({} file(s) missing, {} unhashable) in {:.1?}",
-        contents.len(),
-        already_hashed,
-        newly_hashed,
-        file_missing,
-        unhashable,
-        started.elapsed()
+        "contents: {} total — already hashed: {}, newly hashed: {} ({} file(s) missing, {} unhashable) in {:.1?} — avg {:.1} ms/content ({:.1} content(s)/s)",
+        c.total,
+        c.already,
+        c.newly,
+        c.missing,
+        c.bad,
+        started.elapsed(),
+        started.elapsed().as_secs_f64() * 1000.0 / c.done.max(1) as f64,
+        c.done.max(1) as f64 / started.elapsed().as_secs_f64().max(0.001),
     );
     println!(
         "vec: {} pHash embeddings → {}",
@@ -337,66 +429,70 @@ fn run_generate_embeddings(db_path: &Path, key: Option<&str>) -> Result<(), Box<
     db::create_table(&conn)?;
 
     let contents = db::contents_all(&conn)?;
-    let mut already_embedded = 0usize;
-    let mut newly_embedded = 0usize;
-    let mut file_missing = 0usize;
-    let mut failed = 0usize;
 
     let all_paths: HashMap<String, Vec<String>> = db::all_paths_by_content(&conn)?;
     let index_path = vecsearch::index_path(db_path);
     let mut store = vecsearch::VectorStore::open(&index_path)?;
 
+    println!(
+        "enriching {} content(s) with SigLIP 2 embeddings → {}",
+        contents.len(),
+        index_path.display()
+    );
     // Warm-up semantics: fetch ALL model files (vision + text + tokenizer)
     // so every later usage scenario works offline, not just this pass.
-    embed::ensure_models().map_err(|e| e.to_string())?;
-    let vision_model = embed::ensure_file(embed::VISION_FILE).map_err(|e| e.to_string())?;
+    // The first ever run downloads ~512 MB — per-file progress lines show
+    // what was cached and what had to come over the network.
+    let fetched = embed::ensure_models().map_err(|e| e.to_string())?;
+    embed::report_fetched(&fetched);
+    let vision_model = fetched
+        .iter()
+        .find(|f| f.repo_file == embed::VISION_FILE)
+        .map(|f| f.path.clone())
+        .ok_or("vision model missing from warm-up")?;
     let mut embedder = embed::Embedder::new(&vision_model).map_err(|e| e.to_string())?;
 
-    for (done, content_hash) in contents.iter().enumerate() {
+    let prog = EnrichProgress::new(contents.len(), "embedded", "failed");
+    for content_hash in &contents {
+        let mut c = prog.counters();
+        c.done += 1;
         // The USearch key IS the lookup: an existing embedding means the
         // content was embedded in an earlier pass — no decode needed.
         if store.semantic_has(content_hash) {
-            already_embedded += 1;
+            c.already += 1;
             continue;
         }
         let paths = all_paths.get(content_hash).cloned().unwrap_or_default();
-        let live = paths.iter().find(|p| Path::new(p).exists());
-        let Some(live_path) = live else {
-            file_missing += 1;
+        let Some(live_path) = paths.iter().find(|p| Path::new(p).exists()) else {
+            c.missing += 1;
             continue;
         };
         match embedder.embed(Path::new(live_path)) {
             Ok(embedding) => {
                 store.semantic_add(content_hash, &embedding)?;
-                newly_embedded += 1;
+                c.newly += 1;
             }
             Err(_) => {
-                failed += 1;
+                c.bad += 1;
             }
         }
-
-        if newly_embedded.is_multiple_of(250) && newly_embedded > 0 {
-            println!(
-                "  … {}/{} contents processed ({} newly embedded)",
-                done + 1,
-                contents.len(),
-                newly_embedded
-            );
-        }
     }
+    let c = prog.finish();
 
-    if newly_embedded > 0 {
+    if c.newly > 0 {
         store.save()?;
     }
 
     println!(
-        "embeddings: {} content(s) total — already embedded: {}, newly embedded: {} ({} file(s) missing, {} failed) in {:.1?}",
-        contents.len(),
-        already_embedded,
-        newly_embedded,
-        file_missing,
-        failed,
-        started.elapsed()
+        "embeddings: {} content(s) total — already embedded: {}, newly embedded: {} ({} file(s) missing, {} failed) in {:.1?} — avg {:.1} ms/content ({:.1} content(s)/s)",
+        c.total,
+        c.already,
+        c.newly,
+        c.missing,
+        c.bad,
+        started.elapsed(),
+        started.elapsed().as_secs_f64() * 1000.0 / c.done.max(1) as f64,
+        c.done.max(1) as f64 / started.elapsed().as_secs_f64().max(0.001),
     );
     println!(
         "vec: {} semantic embeddings → {}",
@@ -602,10 +698,9 @@ fn run_search(
     }
 
     let conn = db::open(db_path, key)?;
-    let mut text_embedder = embed::TextEmbedder::new(
-        &embed::ensure_file(embed::TEXT_FILE)?,
-        &embed::ensure_file(embed::TOKENIZER_FILE)?,
-    )?;
+    let text = embed::ensure_file(embed::TEXT_FILE)?;
+    let tokenizer = embed::ensure_file(embed::TOKENIZER_FILE)?;
+    let mut text_embedder = embed::TextEmbedder::new(&text.path, &tokenizer.path)?;
     let embedding = text_embedder.embed_text(query).map_err(|e| e.to_string())?;
 
     println!(

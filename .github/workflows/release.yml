@@ -151,6 +151,15 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest=true keeps the floating :latest alias on whichever
+          # version is being released (this workflow only ever pushes
+          # v* tags), so `docker pull ghcr.io/<repo>:latest` always
+          # resolves to the newest release — the README examples and
+          # the cosign step below rely on it. The action's default
+          # (latest=auto) would do the same today; this pins the
+          # behavior so it cannot regress silently.
+          flavor: |
+            latest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

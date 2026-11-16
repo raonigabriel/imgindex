@@ -17,8 +17,11 @@
 //! (silent CPU fallback is ORT's own behavior).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
+use std::time::Instant;
 
+use hf_hub::progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler};
 use ort::environment::Environment;
 use ort::session::{builder::GraphOptimizationLevel, Session, SessionOutputs};
 use ort::value::Tensor;
@@ -27,6 +30,188 @@ use tokenizers::Tokenizer;
 /// ort rc.14+: exactly one ORT environment per process; every session
 /// builder takes it. Created lazily on the first session.
 static ORT_ENV: OnceLock<Environment> = OnceLock::new();
+
+/// What fetching one model file ended up doing — the per-file verdict
+/// the CLI prints so headless runs (cron, agents) can tell whether
+/// anything left the machine.
+pub struct FetchedFile {
+    /// Repo-relative path, e.g. `onnx/vision_model_q4f16.onnx`.
+    pub repo_file: String,
+    /// Resolved snapshot path inside the Hugging Face cache.
+    pub path: PathBuf,
+    /// `Some((bytes, seconds))` when a download happened, `None` when
+    /// the file was already cached.
+    pub downloaded: Option<(u64, f32)>,
+}
+
+/// Print one line per fetched file plus where the repo lives in the
+/// cache. Plain, append-only, no cursor games — safe for logs and pipes.
+pub fn report_fetched(files: &[FetchedFile]) {
+    for f in files {
+        match &f.downloaded {
+            Some((bytes, secs)) => println!(
+                "  model: {} — downloaded {} in {:.1}s",
+                f.repo_file,
+                fmt_bytes(*bytes),
+                secs
+            ),
+            None => println!("  model: {} — cached", f.repo_file),
+        }
+    }
+    // The three files share one snapshot dir (…/snapshots/<commit>);
+    // surface it once so users know exactly where the bytes landed.
+    if let Some(dir) = files.first().and_then(|f| snapshot_dir(&f.path)) {
+        println!("  model location: {}", dir.display());
+    }
+}
+
+/// …/snapshots/<commit> for a file resolved inside the HF cache.
+fn snapshot_dir(path: &Path) -> Option<&Path> {
+    let mut prev = path;
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("snapshots") {
+            return Some(prev);
+        }
+        prev = ancestor;
+    }
+    None
+}
+
+/// Live feedback for model downloads: hf-hub fires per-file deltas and
+/// xet batch totals at ~10 Hz; we condense them to one "downloading"
+/// line when real bytes start moving plus one line per 10% milestone.
+/// Plain text only — no colors, no cursor rewriting, cron/pipe safe.
+/// Cache hits emit only a terminal event with no bytes moved: they
+/// print nothing here (the cached/downloaded verdict comes from
+/// `ensure_file`'s result).
+struct ModelDownloadProgress {
+    default_label: String,
+    state: Mutex<DownloadState>,
+}
+
+#[derive(Default)]
+struct DownloadState {
+    default_label: String,
+    started: Option<Instant>,
+    label: String,
+    done: u64,
+    total: u64,
+    moved: bool,
+    /// Highest 10%-milestone printed so far (0-9).
+    milestone: u8,
+}
+
+impl ProgressHandler for ModelDownloadProgress {
+    fn on_progress(&self, event: &ProgressEvent) {
+        let ProgressEvent::Download(ev) = event else { return };
+        let mut st = self.state.lock().expect("download progress poisoned");
+        if st.default_label.is_empty() {
+            st.default_label = self.default_label.clone();
+        }
+        match ev {
+            DownloadEvent::Start { .. } => {} // per-file lines carry the detail
+            DownloadEvent::Progress { files } => {
+                // Single-file downloads here: surface whichever file the
+                // delta talks about (the one with the largest total wins).
+                let Some(f) = files.iter().max_by_key(|f| f.total_bytes) else {
+                    return;
+                };
+                if f.status == FileStatus::Complete && f.total_bytes == 0 {
+                    return; // fast-path cache-hit signal, not a transfer
+                }
+                if st.note(&f.filename, f.bytes_completed, f.total_bytes) {
+                    println!(
+                        "  model: {} — downloading {} …",
+                        st.display_label(),
+                        if st.total > 0 {
+                            fmt_bytes(st.total)
+                        } else {
+                            "…".to_string()
+                        }
+                    );
+                }
+            }
+            DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => {
+                if st.note("download", *bytes_completed, *total_bytes) {
+                    println!(
+                        "  model: {} — downloading {} …",
+                        st.display_label(),
+                        if st.total > 0 {
+                            fmt_bytes(st.total)
+                        } else {
+                            "…".to_string()
+                        }
+                    );
+                }
+            }
+            DownloadEvent::Complete => {
+                // The outcome line ("downloaded"/"cached") is printed by
+                // the caller from `FetchedFile`. Do NOT reset the state
+                // here: `ensure_file` reads `moved`/totals after send()
+                // returns to build that verdict, and each call gets its
+                // own handler instance anyway.
+            }
+        }
+        // 10%-milestone lines: deterministic, append-only, at most nine
+        // per file (100% is covered by the caller's "downloaded" line).
+        if st.total == 0 || st.done == 0 {
+            return;
+        }
+        let decade = (100 * st.done / st.total) as u8 / 10;
+        if decade > st.milestone && decade < 10 {
+            st.milestone = decade;
+            println!(
+                "  model: {} — {}% ({}/{})",
+                st.display_label(),
+                decade * 10,
+                fmt_bytes(st.done),
+                fmt_bytes(st.total)
+            );
+        }
+    }
+}
+
+impl DownloadState {
+    /// Records one progress delta; returns true on the first real
+    /// transfer event (the "downloading …" announcement).
+    fn note(&mut self, label: &str, done: u64, total: u64) -> bool {
+        if done == 0 && total == 0 {
+            return false; // preflight / chunk-resolution placeholder
+        }
+        let first = !self.moved;
+        self.moved = true;
+        self.label = label.to_string();
+        self.done = done;
+        self.total = total;
+        if first {
+            self.started = Some(Instant::now());
+        }
+        first
+    }
+
+    /// The file's repo path when known, falling back to whatever the
+    /// events called it ("download" for xet aggregates).
+    fn display_label(&self) -> &str {
+        match self.label.as_str() {
+            "" | "download" => &self.default_label,
+            other => other,
+        }
+    }
+}
+
+/// Human-readable byte count: MB below 1 GiB, GB from there on.
+fn fmt_bytes(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb < 1024.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.2} GB", mb / 1024.0)
+    }
+}
 
 fn ort_environment() -> Result<Environment, String> {
     if let Some(env) = ORT_ENV.get() {
@@ -85,26 +270,56 @@ fn cleanup_legacy_model_cache() {
 }
 
 /// Resolve one repo file through the Hugging Face cache: returns the
-/// cached snapshot path, downloading on first use. Content-addressed,
-/// with on-disk locking — concurrent fetches deduplicate.
-pub fn ensure_file(repo_file: &str) -> Result<PathBuf, String> {
+/// resolved snapshot path plus whether a download was required. The
+/// progress handler is shared between the client call and this check,
+/// so the cached/downloaded verdict is exact, not inferred from
+/// mtimes. Content-addressed, with on-disk locking — concurrent
+/// fetches deduplicate. Downloads print "downloading …" +
+/// 10%-milestone lines (see `ModelDownloadProgress`); cache hits are
+/// silent here.
+pub fn ensure_file(repo_file: &str) -> Result<FetchedFile, String> {
     let client = hf_hub::HFClientSync::new().map_err(|e| format!("hf client: {e}"))?;
-    client
+    let progress = Arc::new(ModelDownloadProgress {
+        default_label: repo_file.to_string(),
+        state: Mutex::new(DownloadState::default()),
+    });
+    let path = client
         .model(REPO_ORG, REPO_NAME)
         .download_file()
         .filename(repo_file)
+        .progress(Arc::clone(&progress))
         .send()
-        .map_err(|e| format!("hf download ({repo_file}): {e}"))
+        .map_err(|e| format!("hf download ({repo_file}): {e}"))?;
+    let downloaded = {
+        let st = progress.state.lock().expect("download progress poisoned");
+        if st.moved {
+            Some((
+                st.total.max(st.done),
+                st.started
+                    .map(|s| s.elapsed().as_secs_f32())
+                    .unwrap_or(0.0),
+            ))
+        } else {
+            None
+        }
+    };
+    Ok(FetchedFile {
+        repo_file: repo_file.to_string(),
+        path,
+        downloaded,
+    })
 }
 
 /// Make sure all three model files are present in the HF cache. Runs the
-/// legacy-cache cleanup; repeated calls are cache hits.
-pub fn ensure_models() -> Result<(), String> {
+/// legacy-cache cleanup; repeated calls are cache hits. Returns the
+/// per-file outcomes for the CLI to report.
+pub fn ensure_models() -> Result<Vec<FetchedFile>, String> {
     cleanup_legacy_model_cache();
-    ensure_file(VISION_FILE)?;
-    ensure_file(TEXT_FILE)?;
-    ensure_file(TOKENIZER_FILE)?;
-    Ok(())
+    Ok(vec![
+        ensure_file(VISION_FILE)?,
+        ensure_file(TEXT_FILE)?,
+        ensure_file(TOKENIZER_FILE)?,
+    ])
 }
 
 fn l2_normalize(v: &mut [f32]) {

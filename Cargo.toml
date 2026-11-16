@@ -1,6 +1,6 @@
 [package]
 name = "imgindex"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 description = "Append-only local image index: content hashing, perceptual hashes and SigLIP 2 embeddings with USearch vector search"
 license = "Apache-2.0"

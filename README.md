@@ -64,7 +64,7 @@ downloads on first use into the Hugging Face cache.
 ```bash
 # pick the asset matching your architecture
 # (uname -m: x86_64 -> amd64, aarch64 -> arm64)
-V=v0.15.0
+V=v0.17.0
 curl -fLO "https://github.com/raonigabriel/imgindex/releases/download/${V}/imgindex-linux-amd64"
 chmod +x imgindex-linux-amd64
 sudo mv imgindex-linux-amd64 /usr/local/bin/imgindex   # or ~/.local/bin, no sudo
@@ -170,11 +170,20 @@ imgindex --skill                      # SKILL.md for agents (content only —
   --top <N>                 result count for --search [default: 20]
 ```
 
-`--create` prints its progress live: the scan root up front, an
-aggregated counter line every 5 seconds (`processed / indexed / ignored`,
-+delta in the last 5s), the total candidate count when the folder walk
-finishes, and an end-of-run report with the average processing time per
-file.
+Every pass prints its progress live. `--create` shows the scan root up
+front, an aggregated counter line every 5 seconds (`processed /
+indexed / ignored`, +delta in the last 5s), the total candidate count
+when the folder walk finishes, and an end-of-run report with the
+average processing time per file. The enrichment passes follow the
+same pattern — an up-front line with the content count, a 5-second
+ticker (`done / total`, per-group counters, +delta), and an end-of-run
+report with the average time per content. Model fetching is plain,
+append-only text — no colors, no cursor rewriting, cron/pipe safe:
+each file gets an explicit `cached` or `downloaded` verdict (with size
+and duration), downloads announce themselves and print one line per
+10%, and one `model location` line shows where the files live in the
+Hugging Face cache. A warm-cache run logs just the three `cached`
+verdicts.
 
 ## What pass 1 alone already gives you
 
@@ -337,22 +346,61 @@ blank content) — pHash completeness is tracked by `--generate-phash`'s
 counters, and the SigLIP embedding is only stored for fully decodable
 images.
 
+## The model files and the Hugging Face cache
+
+The ML side — `--generate-embeddings`, `--search` and
+`--download-model` — shares three files from one Hugging Face repo,
+[`onnx-community/siglip2-base-patch32-256-ONNX`](https://huggingface.co/onnx-community/siglip2-base-patch32-256-ONNX)
+— SigLIP 2 base, quantized to **q4f16** (4-bit weights, fp16
+activations). Why q4f16 and not the smaller-looking int8 exports: int8
+uses `ConvInteger` ops that ONNX Runtime's CPU provider does not
+implement, so q4f16 is not just smaller, it actually runs. Full
+research: [docs/embedding-model-research.md](docs/embedding-model-research.md).
+
+| File | Size | Loaded by |
+|---|---|---|
+| `onnx/vision_model_q4f16.onnx` | ~56 MB | `--generate-embeddings` (image tower) |
+| `onnx/text_model_q4f16.onnx` | ~423 MB | `--search` (text tower) |
+| `tokenizer.json` | ~33 MB | `--search` (query tokenization) |
+
+`--generate-embeddings` and `--download-model` deliberately fetch **all
+three** (warm-up semantics), so a library indexed once can be searched
+with no further downloads — `--search` itself loads only the text
+tower and the tokenizer. Apache-2.0 weights. Everything lands in the
+official Hugging Face cache, content-addressed and deduplicated:
+
+```
+<cache>/hub/models--onnx-community--siglip2-base-patch32-256-ONNX/
+├── snapshots/<commit>/onnx/vision_model_q4f16.onnx   → ../../blobs/<etag>
+├── snapshots/<commit>/onnx/text_model_q4f16.onnx     → ../../blobs/<etag>
+└── snapshots/<commit>/tokenizer.json                 → ../../blobs/<etag>
+```
+
+That is the same layout every HF client uses, so imgindex, `hf
+download`, `transformers` and any Python tool all read — and share —
+the same copy of the model.
+
+**Where the cache is** — resolved in this order: `HF_HUB_CACHE` →
+`HUGGINGFACE_HUB_CACHE` → `$HF_HOME/hub` → `$XDG_CACHE_HOME/huggingface`
+→ `~/.cache/huggingface`. Two more variables matter for special
+setups: `HF_ENDPOINT` (mirror/proxy base URL instead of
+huggingface.co) and `HF_TOKEN` / `HF_TOKEN_PATH` (authenticated
+endpoints).
+
+**Offline behavior** — once the three files are cached,
+`--generate-embeddings` and `--search` run with the network completely
+disabled, reading the cache without writing anything (the online path,
+by contrast, revalidates against the Hub and writes lock files even on
+a cache hit). That is what makes `--download-model` a complete air-gap
+prep command.
+
 ## Notes
 
 - **CPU only (for now)** — inference runs on ONNX Runtime's CPU
   execution provider, so anyone can use it. GPU execution providers
   (CUDA/DirectML/CoreML) can be enabled later via `ort` cargo features.
-- **Model download** — the SigLIP 2 q4f16 ONNX (~55 MB) is fetched from
-  Hugging Face into the official HF cache on first use of
-  `--generate-embeddings` / `--download-model`; `--download-model`
-  prefetches everything (vision + text encoder + tokenizer) for
-  air-gapped use. Apache-2.0 weights.
 - **No migration machinery** — after upgrading, delete the db and
   `.safegraphs` files and re-run the passes for a clean rebuild.
-- **Why q4f16 and not int8** — the int8 ONNX exports use `ConvInteger`
-  ops that ONNX Runtime's CPU provider does not implement; q4f16
-  (4-bit weights, fp16 activations) is smaller *and* actually runs.
-  Full research: [docs/embedding-model-research.md](docs/embedding-model-research.md).
 
 ## Keeping it fresh with cron
 
@@ -375,49 +423,159 @@ database.
 
 ## Docker
 
-Images are published for **linux/amd64** and **linux/arm64**. The
-container runs as **uid 1000** (Ubuntu 26.04's default user) on an
-Ubuntu 26.04 base with `ca-certificates` and `libstdc++6`; the binary
-is otherwise self-contained.
+Images are published for **linux/amd64** and **linux/arm64** at
+`ghcr.io/raonigabriel/imgindex`. The examples below use `:latest`,
+which always points at the newest release (CI keeps the alias in sync
+on every version push). If you want reproducibility, pin a version
+instead: `0.17` follows patch releases of this minor, `0.17.0` is
+frozen to exactly this version. The container is Ubuntu 26.04 running
+as **uid 1000** (the base image's default user, whose home is
+`/home/ubuntu`) with nothing but `ca-certificates` and `libstdc++6`
+added — the binary is self-contained.
 
-There are two bind mounts you care about:
+### How the container finds things
 
-| Mount | What | Required by |
-|---|---|---|
-| `/data` | a writable state folder — the database, the vector indexes and the downloaded model live here | every pass |
-| `/home/imgindex/.cache/huggingface` | your **existing** Hugging Face cache (`~/.cache/huggingface` on the host) — optional; shares the SigLIP 2 model with your host tools instead of re-downloading it | `--generate-embeddings`, `--search` |
+Every `docker run` is determined by three facts. Once they're clear,
+the mounts in the examples below explain themselves:
 
-Typical workflow — index a library (e.g. `~/Pictures`), enrich, search:
+1. **The scan root is a command-line argument** (`--create <ROOT>`).
+   It can be any path as long as it exists *inside the container* —
+   whatever you want scanned must be bind-mounted first.
+2. **All state is written to the current working directory** —
+   `image_index.db` and `image_index.safegraphs` always land in the
+   CWD, never next to the scanned files. The image's default CWD is
+   `/data`; point `-w`/`--workdir` wherever you want the state.
+3. **The model cache is `$HOME/.cache/huggingface`** — inside the
+   container that is `/home/ubuntu/.cache/huggingface` (`HF_HOME` and
+   `HF_HUB_CACHE` are respected). The SigLIP 2 weights total ~512 MB
+   (see [the model section](#the-model-files-and-the-hugging-face-cache)
+   for the file breakdown); bind-mounting your existing host cache
+   there means the download happens once and is shared with host
+   tools (`hf download`, transformers, Python) instead of being thrown
+   away with every `--rm` container.
+
+Putting those together, this is what each pass actually needs —
+everything else in the examples below is just arranging mounts to
+provide exactly these:
+
+| Pass | Library (read-only is fine) | State = the CWD (writable) | Model cache |
+|---|---|---|---|
+| `--create` | yes | write | — |
+| `--generate-phash` | yes — re-opens the files pass 1 recorded | write | — |
+| `--generate-embeddings` | yes — same | write | read (write only when a model file is missing) |
+| `--search` | no — paths come from the db | read | read (write only when a model file is missing) |
+
+### The simple way — mount your home at the container's home
+
+One mount makes your home the container's home: the library, the
+state folder and the model cache are then all just ordinary files in
+your home directory. This is the easiest setup and the recommended
+one:
 
 ```bash
 mkdir -p ~/imgindex
 
-# Pass 1 — index the library (a read-only mount is enough: --create only reads)
+# Pass 1 — scan ~/Pictures. --create only reads the library; the
+# database is written to the working directory (-w), which through the
+# home mount is ~/imgindex on the host.
 docker run --rm \
-  -v "$HOME/Pictures:/library:ro" \
-  -v "$HOME/imgindex:/data" \
-  ghcr.io/<owner>/imgindex --create /library
+  -v "$HOME:/home/ubuntu" \
+  -w /home/ubuntu/imgindex \
+  ghcr.io/raonigabriel/imgindex:latest --create /home/ubuntu/Pictures
 
-# Pass 3 — SigLIP 2 embeddings (the model comes from your HF cache,
-# shared with host tools like `hf download` / transformers / Python)
+# Pass 3 — SigLIP 2 embeddings. The model downloads into
+# ~/.cache/huggingface — which is the mounted home, so it is shared
+# with host tools and survives the container being removed.
+# (Pass 2, --generate-phash, needs no model; same command shape.)
 docker run --rm \
-  -v "$HOME/imgindex:/data" \
-  -v "$HOME/.cache/huggingface:/home/imgindex/.cache/huggingface" \
-  ghcr.io/<owner>/imgindex --generate-embeddings
+  -v "$HOME:/home/ubuntu" \
+  -w /home/ubuntu/imgindex \
+  ghcr.io/raonigabriel/imgindex:latest --generate-embeddings
 
 # Text search over the embeddings
 docker run --rm \
-  -v "$HOME/imgindex:/data" \
-  -v "$HOME/.cache/huggingface:/home/imgindex/.cache/huggingface" \
-  ghcr.io/<owner>/imgindex --search "a small girl playing with dolls" --top 10
+  -v "$HOME:/home/ubuntu" \
+  -w /home/ubuntu/imgindex \
+  ghcr.io/raonigabriel/imgindex:latest --search "a small girl playing with dolls" --top 10
 ```
 
-- The container runs as uid 1000 to match a typical Linux host user, so
-  bind-mounted files keep their ownership and the generated index files
-  belong to you. If your host UID differs, add
-  `--user "$(id -u):$(id -g)"` and make the mounts writable by it.
-- Without the HF cache mount, the model downloads once into the
-  container's own cache and works fully offline afterwards.
+- The container runs as uid 1000 to match a typical first Linux user,
+  so everything it writes belongs to you. If your host UID differs,
+  add `--user "$(id -u):$(id -g)"` and make the involved folders
+  writable by that uid.
+- **Paths stored in the database are the container-side paths**
+  (`/home/ubuntu/Pictures/...`). That is invisible as long as every
+  pass over one database runs with the same mounts — but don't mix
+  native and container runs on the same database: the same files seen
+  through different paths are appended as different observations.
+
+### The least-privilege alternative
+
+Handing the container your whole home is convenient but broad. If you
+prefer minimal mounts, mount only what each pass actually touches —
+the library (read-only), one writable state folder, and the HF cache
+for anything that runs the model:
+
+```bash
+mkdir -p ~/imgindex
+
+# Pass 1 — a read-only library mount is enough: --create only reads it,
+# and no model is involved. State goes to the default CWD, /data.
+docker run --rm \
+  -v "$HOME/Pictures:/library:ro" \
+  -v "$HOME/imgindex:/data" \
+  ghcr.io/raonigabriel/imgindex:latest --create /library
+
+# Pass 3 — two extra mounts, both required:
+#   * the HF cache, so the model is not re-downloaded (~512 MB) into
+#     the ephemeral container — note it goes to the REAL cache path,
+#     /home/ubuntu/.cache/huggingface, matching the container's HOME;
+#   * the library again: the enrichment pass re-opens the files
+#     recorded by pass 1 — without this mount nothing gets embedded.
+docker run --rm \
+  -v "$HOME/Pictures:/library:ro" \
+  -v "$HOME/imgindex:/data" \
+  -v "$HOME/.cache/huggingface:/home/ubuntu/.cache/huggingface" \
+  ghcr.io/raonigabriel/imgindex:latest --generate-embeddings
+
+# Search needs the state folder and the model (text tower + tokenizer),
+# but not the library — result paths are looked up in the database.
+docker run --rm \
+  -v "$HOME/imgindex:/data" \
+  -v "$HOME/.cache/huggingface:/home/ubuntu/.cache/huggingface" \
+  ghcr.io/raonigabriel/imgindex:latest --search "a small girl playing with dolls" --top 10
+```
+
+A few properties worth knowing, all verified against the published
+image:
+
+- Keep the cache mount **writable** for normal runs: even a warm cache
+  hit revalidates against the Hub and touches the cache's lock files —
+  a read-only mount fails at the first model access (verified: the
+  failure is exactly `Read-only file system`). A read-only cache mount
+  works only in the air-gap case below.
+- Once the model is cached, everything also runs with the network
+  disabled (`--network none`) — cache reads with no downloads and no
+  writes at all, which is the one case where a read-only cache mount
+  is fine.
+
+### Or: one folder for everything, model included
+
+If you prefer a single self-contained directory — database, vector
+index *and* model — point `HF_HOME` inside the state mount instead of
+mounting the cache separately:
+
+```bash
+docker run --rm \
+  -v "$HOME/Pictures:/library:ro" \
+  -v "$HOME/imgindex:/data" \
+  -e HF_HOME=/data/hf \
+  ghcr.io/raonigabriel/imgindex:latest --generate-embeddings
+```
+
+The model then lives under `~/imgindex/hf/hub/` on the host, and the
+folder is trivially movable/backable as a unit. (Use the same
+`-e HF_HOME=/data/hf` on every pass that runs the model.)
 
 ## License
 
