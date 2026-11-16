@@ -45,6 +45,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          # the binary's --version is baked from Cargo.toml at compile
+          # time; refuse to ship a release whose tag disagrees with it.
+          # workflow_dispatch runs have no vX.Y.Z ref — skip there.
+          case "${GITHUB_REF_NAME}" in
+            v*)
+              CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+              TAG_VER="${GITHUB_REF_NAME#v}"
+              echo "Cargo.toml: $CARGO_VER, tag: v$TAG_VER"
+              [ "$CARGO_VER" = "$TAG_VER" ] || {
+                echo "::error::tag v$TAG_VER != Cargo.toml version $CARGO_VER — bump Cargo.toml (and commit the updated Cargo.lock), then re-tag"
+                exit 1
+              }
+              ;;
+            *) echo "not a tag push, skipping version check" ;;
+          esac
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
