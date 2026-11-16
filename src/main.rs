@@ -412,7 +412,16 @@ fn process_file(task: FileTask, skipped_not_image: &AtomicU64) -> Option<ScanRes
 
     let mut hasher = Sha256::new();
     hasher.update(&head[..filled]);
-    std::io::copy(&mut reader, &mut hasher).ok()?;
+    // digest 0.11 dropped std::io::Write for hashers, so stream the
+    // file into the hasher explicitly instead of std::io::copy
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
     let content_hash = hex::encode(hasher.finalize());
 
     let path_str = path.to_string_lossy().into_owned();
