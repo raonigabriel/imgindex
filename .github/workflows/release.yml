@@ -15,12 +15,13 @@ env:
 
 jobs:
   # Native builds, one job per architecture, in parallel. Each runs inside
-  # an ubuntu:24.04 container on a NATIVE runner — no QEMU, so the arm64
-  # build is as fast as the amd64 one. Building on 24.04 (glibc 2.39)
-  # keeps the binary runnable on the debian:trixie-slim runtime image
-  # (glibc 2.41); measured symbol floor of the shipped binary is 2.38
-  # (includes the statically linked ONNX Runtime 1.31 prebuilt that
-  # ort-sys downloads). libssl-dev is build-time only: ort-sys's model
+  # an ubuntu:26.04 container on a NATIVE runner — no QEMU, so the arm64
+  # build is as fast as the amd64 one. Build and runtime glibc move
+  # together: the Dockerfile runtime image is ubuntu:26.04 too (the
+  # binary's glibc symbol floor — 2.43, float-math symbols via
+  # ORT/USearch — comes from the build container), and the docker job
+  # smoke-tests the pushed image so a build/runtime mismatch fails CI
+  # instead of shipping. libssl-dev is build-time only: ort-sys's model
   # downloader links it; nothing of it ships in the runtime image.
   build:
     name: Build linux/${{ matrix.arch }}
@@ -34,7 +35,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
-      image: ubuntu:24.04
+      image: ubuntu:26.04
     steps:
       - name: Install build prerequisites
         run: |
@@ -177,6 +178,15 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+      - name: Smoke test the published image
+        if: startsWith(github.ref, 'refs/tags/v')
+        # run the binary inside the final runtime image: proves the
+        # build/runtime glibc pairing before the release is callable
+        run: |
+          docker run --rm --platform linux/amd64 \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+            --version
 
   # GitHub release with the packaged binaries (tag pushes only).
   release:

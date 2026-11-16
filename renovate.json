@@ -2,17 +2,5 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ],
-  "packageRules": [
-    {
-      "description": "ubuntu builds the release container only; building on newer glibc ships binaries the debian trixie runtime image cannot run (tested 2026-11). See imgindex PR #8.",
-      "matchManagers": [
-        "docker"
-      ],
-      "matchDepNames": [
-        "ubuntu"
-      ],
-      "enabled": false
-    }
   ]
 }

@@ -64,7 +64,7 @@ downloads on first use into the Hugging Face cache.
 ```bash
 # pick the asset matching your architecture
 # (uname -m: x86_64 -> amd64, aarch64 -> arm64)
-V=v0.14.0
+V=v0.15.0
 curl -fLO "https://github.com/raonigabriel/imgindex/releases/download/${V}/imgindex-linux-amd64"
 chmod +x imgindex-linux-amd64
 sudo mv imgindex-linux-amd64 /usr/local/bin/imgindex   # or ~/.local/bin, no sudo
@@ -343,8 +343,8 @@ database.
 ## Docker
 
 Images are published for **linux/amd64** and **linux/arm64**. The
-container runs as **uid 1000** (the image's `imgindex` user) on a
-Debian 13 slim base with `ca-certificates` and `libstdc++6`; the binary
+container runs as **uid 1000** (Ubuntu 26.04's default user) on an
+Ubuntu 26.04 base with `ca-certificates` and `libstdc++6`; the binary
 is otherwise self-contained.
 
 There are two bind mounts you care about:
