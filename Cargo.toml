@@ -17,7 +17,7 @@ walkdir = "2"
 sha2 = "0.10"
 hex = "0.4"
 # mime sniffing from magic bytes (never trust the extension)
-infer = "0.16"
+infer = "0.22"
 # image decoding: dimensions + perceptual hash (pHash). Decoders shipped
 # in the binary: JPEG, PNG, WebP, TIFF, GIF, BMP.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "gif", "bmp"] }
@@ -30,7 +30,7 @@ flate2 = "1"
 # ort-sys's build-time model downloader links the build container's
 # system OpenSSL instead (release.yml installs libssl-dev for it) —
 # neither ships in the runtime image.
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "functions"] }
+rusqlite = { version = "0.43", features = ["bundled-sqlcipher-vendored-openssl", "functions"] }
 # vector search: pHash embeddings live in a separate USearch proximity-
 # graph index file (image_vectors.safegraphs). Needs cmake + g++ at BUILD
 # time only; the binary is self-contained.
